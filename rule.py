@@ -21,7 +21,7 @@ The "-2" is the decoupling: classic (Gated) DeltaNet ties erase and write
 to one scalar β_r; here b (key side) and w (value side) are independent
 per-channel gates.
 
-Four implementations of the same recurrence:
+Five implementations of the same recurrence:
 
   _recurrent_single           token-by-token scan of Eq. 9/29. O(L·dk·dv),
                               trivially correct — the verification oracle.
@@ -44,6 +44,15 @@ Four implementations of the same recurrence:
                               einsums instead of matmuls for T and A_qk.
                               Use when gate values exceed the centered
                               core's range and chunk_size cannot shrink.
+  _chunkwise_single_subchunking
+                              middle ground (GLA-style secondary chunking):
+                              T and A_qk are assembled from sub-blocks of
+                              size c. Off-diagonal block pairs factor the
+                              decay through the row-block's entry boundary
+                              — both factors have exponents ≤ 0 — and stay
+                              batched MATMULS; only the c×c diagonal blocks
+                              use the pairwise form. NO range limit, with
+                              memory overhead ×(C/c) instead of ×C.
 
 Chunkwise idea (Sec. 3.3 / App. A): substituting S_r = Diag(γ_r) Ŝ_r with
 γ_r = exp(Σ_{i≤r} g_i) removes the decay from the recurrence — Ŝ follows a
@@ -466,8 +475,8 @@ def _chunkwise_single_pairwise(
     over a [N, C, C, dk] decay tensor — ×C more memory on the score path
     and no tensor-core mapping. Use this core only when the decay is too
     strong for _chunkwise_single_centered (per-chunk |G_C| > ~176) and
-    shrinking chunk_size is not an option; production kernels solve the
-    same problem with secondary (sub-block) chunking instead.
+    shrinking chunk_size is not an option; _chunkwise_single_subchunking
+    solves the same problem with a better memory/compute profile.
 
     Args / returns: identical to _chunkwise_single_faithful.
     """
@@ -552,6 +561,176 @@ def _chunkwise_single_pairwise(
     # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
     # Identical to the faithful variant (raw chunk-entry state, no S0
     # pre-scaling) since Ē and Q_γ carry the true absolute γ here.
+    def chunk_step(
+        S: jax.Array,
+        inp: tuple[jax.Array, ...],
+    ) -> tuple[jax.Array, jax.Array]:
+        # S: [dk, dv].  Per-chunk slices: Y_n [C, dk], U_n [C, dv],
+        # Aqk_n [C, C], Qg_n [C, dk], Ktail_n [C, dk], gamma_C_n [dk].
+        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
+
+        # Eq. 35:  R = U − Y S0 — stacked residuals ρ_r (Eq. 37).   [C, dv]
+        R = U_n - Y_n @ S
+
+        # Eq. 24/44:  O = Q_γ S0 + A_qk R — history + intra-chunk.  [C, dv]
+        o = Qg_n @ S + Aqk_n @ R
+
+        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
+        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
+
+        return S_new, o
+
+    # scan carries S across chunks; stacked outputs o: [N, C, dv].
+    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
+    return o.reshape(L, dv), S_final
+
+
+def _chunkwise_single_subchunking(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    S0: jax.Array,
+    chunk_size: int,
+    sub_chunk_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunkwise WY forward for ONE (batch, head) pair, secondary chunking.
+
+    GLA-style middle ground between the centered and pairwise cores. The
+    triangular solve, WY auxiliaries, and cross-chunk scan are unchanged at
+    full chunk size C; only the construction of the decay-aware score
+    matrices T (Eq. 21/34) and A_qk (Eq. 25/43) differs. Each chunk is split
+    into M = C/c sub-blocks of size c, and the entry (r, s) is built by
+    where the pair falls:
+
+      * OFF-DIAGONAL block pair (row r in sub-block i, column s in an
+        earlier sub-block j < i): factor the decay ratio through the
+        row-block's entry boundary B_i = G at the last position before
+        sub-block i,
+            exp(G_r − G_s) = exp(G_r − B_i) · exp(B_i − G_s),
+        and since s ≤ (boundary) ≤ r and G is non-increasing, BOTH
+        exponents are ≤ 0 — each factor lies in (0, 1], so these blocks are
+        ordinary batched matmuls with no overflow at any decay strength.
+      * DIAGONAL block (r, s in the same sub-block): the boundary trick
+        cannot help (no boundary between them), so use the pairwise
+        log-space form exp(G_r − G_s) per (r, s, channel) triple — but only
+        over c×c blocks, a [N, M, c, c, dk] intermediate (×c memory)
+        instead of the pairwise core's [N, C, C, dk] (×C).
+
+    Result: NO decay-range limit (like the pairwise core), matmul-dominated
+    compute (like the centered core), memory overhead ×(C/c) on the
+    rescaled-key tensor + ×c on the diagonal blocks. This is the
+    block-decomposition production Triton/CUDA kernels use.
+
+    Args: as _chunkwise_single_faithful, plus
+      sub_chunk_size: c; must divide chunk_size.
+    Returns:
+      (O: [L, dv], S_final: [dk, dv])
+    """
+    L, dk = k.shape
+    dv = v.shape[-1]
+    C = chunk_size
+    c = sub_chunk_size
+    N = L // C   # number of chunks
+    M = C // c   # sub-blocks per chunk
+
+    def to_chunks(x):
+        # [L, d] -> [N, C, d]
+        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
+
+    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
+    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
+
+    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
+    S0 = S0.astype(D_TYPE)          # [dk, dv]
+    e = b * k                       # Eq. 8: erase directions   [N, C, dk]
+
+    # Eq. 18/30:  G_r = Σ_{i≤r} g_i, within-chunk cumulative log-decay.
+    G = jnp.cumsum(g, axis=1)       # [N, C, dk]
+
+    # Total chunk log-decay and carry coefficient of Eq. 23/40.     [N, dk]
+    G_C = G[:, -1]
+    gamma_C = jnp.exp(G_C)
+
+    # ---- Secondary-chunking decomposition of the decay ratios -------------
+    # Sub-block view of G and the entry boundary B_i of each sub-block
+    # (cumulative log-decay at the last position BEFORE the block; B_0 = 0,
+    # matching γ_0 = 1 of Eq. 18/30 at the second level).
+    G4 = G.reshape(N, M, c, dk)                                  # [N, M, c, dk]
+    B = jnp.concatenate(
+        [jnp.zeros((N, 1, dk), dtype=D_TYPE), G4[:, :-1, -1]], axis=1
+    )                                                            # [N, M, dk]
+
+    # Block-local log-decay Grel_r = G_r − B_i ≤ 0 (r is inside block i, at
+    # or after its boundary), so exp(Grel) ∈ (0, 1] — always safe.
+    Grel = G4 - B[:, :, None, :]                                 # [N, M, c, dk]
+
+    # Row-side factors carrying exp(G_r − B_i): the "Ē/Q_γ of the sub-block".
+    Erow = e.reshape(N, M, c, dk) * jnp.exp(Grel)                # [N, M, c, dk]
+    Qrow = q.reshape(N, M, c, dk) * jnp.exp(Grel)                # [N, M, c, dk]
+
+    # Column-side keys rescaled per ROW-block: exp(B_i − G_s) ≤ 1 for s in
+    # any earlier sub-block. Masked to −inf BEFORE the exp — for s at or
+    # after block i the exponent is ≥ 0 and could overflow; exp(−inf) = 0
+    # also implements the block-level causal mask. This [N, M, C, dk] tensor
+    # is the ×(C/c) memory cost of the variant.
+    neg_inf = jnp.array(-jnp.inf, dtype=D_TYPE)
+    col_blk = jnp.arange(C) // c                                 # [C] block of s
+    past = col_blk[None, :] < jnp.arange(M)[:, None]             # [M, C] j < i
+    expo = jnp.where(past[None, :, :, None],
+                     B[:, :, None, :] - G[:, None, :, :], neg_inf)
+    Ksc = k[:, None, :, :] * jnp.exp(expo)                       # [N, M, C, dk]
+
+    # OFF-DIAGONAL blocks of Eq. 21/34 and Eq. 25/43: for each row-block i,
+    # T_rs = (e_r exp(G_r − B_i))ᵀ (k_s exp(B_i − G_s)) — a batched matmul
+    # [M, c, dk] @ [M, dk, C]; columns in blocks ≥ i are exactly 0.
+    T_off = jnp.einsum('nmrd,nmsd->nmrs', Erow, Ksc).reshape(N, C, C)
+    Aqk_off = jnp.einsum('nmrd,nmsd->nmrs', Qrow, Ksc).reshape(N, C, C)
+
+    # DIAGONAL c×c blocks: pairwise log-space differences within each
+    # sub-block (B_i cancels: Grel_r − Grel_s = G_r − G_s). Exponents ≤ 0
+    # under the causal masks, applied before the exp as in the pairwise
+    # core.                                              Gd: [N, M, c, c, dk]
+    Gd = Grel[:, :, :, None, :] - Grel[:, :, None, :, :]
+    strict = jnp.tril(jnp.ones((c, c), dtype=bool), k=-1)   # s <  r (Eq. 21/34)
+    causal = jnp.tril(jnp.ones((c, c), dtype=bool))         # s <= r (Eq. 25/43)
+    D_strict = jnp.exp(jnp.where(strict[None, None, :, :, None], Gd, neg_inf))
+    D_incl = jnp.exp(jnp.where(causal[None, None, :, :, None], Gd, neg_inf))
+    kg = k.reshape(N, M, c, dk)
+    T_diag = jnp.einsum('nmrc,nmsc,nmrsc->nmrs',
+                        e.reshape(N, M, c, dk), kg, D_strict)   # [N, M, c, c]
+    Aqk_diag = jnp.einsum('nmrc,nmsc,nmrsc->nmrs',
+                          q.reshape(N, M, c, dk), kg, D_incl)   # [N, M, c, c]
+
+    # Scatter the diagonal blocks into the [C, C] score matrices (the
+    # off-diagonal parts are 0 there, so add == set).
+    rr = jnp.arange(M)[:, None, None] * c + jnp.arange(c)[None, :, None]
+    ss = jnp.arange(M)[:, None, None] * c + jnp.arange(c)[None, None, :]
+    T = T_off.at[:, rr, ss].add(T_diag)      # Eq. 21/34          [N, C, C]
+    Aqk = Aqk_off.at[:, rr, ss].add(Aqk_diag)  # Eq. 25/43        [N, C, C]
+
+    # ---- From here on identical to the pairwise core ----------------------
+    # Eq. 21/34:  A = (I + T)^{-1} at FULL chunk size C — the sub-chunking
+    # only changed how T's entries were produced.                 [N, C, C]
+    A = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
+    )
+
+    # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe.
+    Ebar = jnp.exp(G) * e   # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)        [N, C, dk]
+    Qg = jnp.exp(G) * q     # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
+    Z = w * v               # Eq. 8, 20/33:  Z = W ⊙ V           [N, C, dv]
+
+    # Eq. 22/34:  WY auxiliaries, one shared inverse (Eqs. 45/46).
+    Y = A @ Ebar   # [N, C, dk]
+    U = A @ Z      # [N, C, dv]
+
+    # Eq. 23/41:  (K_tail)_r = exp(G_C − G_r) ⊙ k_r ≤ k_r.       [N, C, dk]
+    Ktail = k * jnp.exp(G_C[:, None, :] - G)
+
+    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
     def chunk_step(
         S: jax.Array,
         inp: tuple[jax.Array, ...],

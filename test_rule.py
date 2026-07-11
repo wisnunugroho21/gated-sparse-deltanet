@@ -14,6 +14,7 @@ from functools import partial
 from rule import (
     _batchify,
     _chunkwise_single_pairwise,
+    _chunkwise_single_subchunking,
     chunkwise_gated_delta_rule_2,
     recurrent_gated_delta_rule_2,
 )
@@ -23,6 +24,14 @@ def pairwise_gated_delta_rule_2(*args, chunk_size=64):
     """Batched wrapper around the pairwise log-space core (same I/O contract
     as chunkwise_gated_delta_rule_2)."""
     f = partial(_chunkwise_single_pairwise, chunk_size=chunk_size)
+    return _batchify(f)(*args)
+
+
+def subchunk_gated_delta_rule_2(*args, chunk_size=64, sub_chunk_size=16):
+    """Batched wrapper around the secondary-chunking core (same I/O contract
+    as chunkwise_gated_delta_rule_2)."""
+    f = partial(_chunkwise_single_subchunking,
+                chunk_size=chunk_size, sub_chunk_size=sub_chunk_size)
     return _batchify(f)(*args)
 
 rng = np.random.default_rng(0)
@@ -217,5 +226,58 @@ O_ct, S_ct = chunkwise_gated_delta_rule_2(*inp, chunk_size=16)
 e_o = report("pairwise vs centered: O", O_pw, O_ct)
 e_s = report("pairwise vs centered: S_final", S_pw, S_ct)
 assert e_o < 1e-4 and e_s < 1e-4, "pairwise and centered cores disagree"
+
+print("\n=== Test 14: subchunking core vs recurrent, several (C, c) combos ===")
+for C, c in [(16, 4), (32, 8), (64, 8), (64, 16), (64, 32), (64, 64), (128, 16)]:
+    O_sc, S_sc = subchunk_gated_delta_rule_2(*inp, chunk_size=C, sub_chunk_size=c)
+    e_o = report(f"subchunk C={C}, c={c}: O", O_sc, O_rec)
+    e_s = report(f"subchunk C={C}, c={c}: S_final", S_sc, S_rec)
+    assert e_o < 1e-4 and e_s < 1e-4, f"subchunk mismatch at C={C}, c={c}"
+
+print("\n=== Test 15: subchunking core is overflow-proof (beyond centered's ~176 limit) ===")
+for scale, C, c in [(3.0, 64, 16), (5.0, 64, 16), (10.0, 64, 16), (10.0, 64, 8)]:
+    inp_s = make_inputs(B=1, H=1, L=256, dk=16, dv=16, decay_scale=scale)
+    O_sc, S_sc = subchunk_gated_delta_rule_2(*inp_s, chunk_size=C, sub_chunk_size=c)
+    O_ct, _ = chunkwise_gated_delta_rule_2(*inp_s, chunk_size=C)
+    O_rec_s, S_rec_s = recurrent_gated_delta_rule_2(*inp_s)
+    finite_sc = bool(jnp.all(jnp.isfinite(O_sc)) and jnp.all(jnp.isfinite(S_sc)))
+    finite_ct = bool(jnp.all(jnp.isfinite(O_ct)))
+    err = float(jnp.max(jnp.abs(O_sc - O_rec_s)))
+    rel = err / (float(jnp.max(jnp.abs(O_rec_s))) + 1e-30)
+    g_np = np.asarray(inp_s[3])[0, 0]
+    Gcum = np.concatenate([np.cumsum(g_np[i:i + C], axis=0) for i in range(0, 256, C)])
+    print(f"decay_scale={scale:5.1f}, C={C}, c={c:2d}: min within-chunk G={Gcum.min():8.1f}  "
+          f"subchunk finite={finite_sc} rel={rel:.3e}  (centered finite={finite_ct})")
+    assert finite_sc, f"subchunk non-finite at scale={scale}"
+    assert rel < 1e-4, f"subchunk inaccurate at scale={scale}: rel={rel}"
+
+print("\n=== Test 16: subchunking gradients under extreme decay (scale=5, C=64, c=16) ===")
+inp_s = make_inputs(B=1, H=2, L=256, dk=16, dv=16, decay_scale=5.0)
+g_sc = jax.grad(loss_fn(
+    lambda *a: subchunk_gated_delta_rule_2(*a, chunk_size=64, sub_chunk_size=16)))(inp_s)
+g_r = jax.grad(loss_fn(recurrent_gated_delta_rule_2))(inp_s)
+for n, a_, b_ in zip(names, g_sc, g_r):
+    ok = bool(jnp.all(jnp.isfinite(a_)))
+    err = float(jnp.max(jnp.abs(a_ - b_)))
+    rel = err / (float(jnp.max(jnp.abs(b_))) + 1e-30)
+    print(f"grad {n:4s}: finite={ok}  max_err_vs_recurrent={err:.3e}  rel={rel:.3e}")
+    assert ok, f"non-finite subchunk grad {n}"
+    assert rel < 1e-3, f"subchunk grad mismatch {n}: rel={rel}"
+
+print("\n=== Test 17: subchunk vs pairwise vs centered agree in the safe regime ===")
+O_sc, S_sc = subchunk_gated_delta_rule_2(*inp, chunk_size=16, sub_chunk_size=4)
+O_pw, S_pw = pairwise_gated_delta_rule_2(*inp, chunk_size=16)
+O_ct, S_ct = chunkwise_gated_delta_rule_2(*inp, chunk_size=16)
+e1 = report("subchunk vs pairwise: O", O_sc, O_pw)
+e2 = report("subchunk vs centered: O", O_sc, O_ct)
+e3 = report("subchunk vs centered: S_final", S_sc, S_ct)
+assert max(e1, e2, e3) < 1e-4, "subchunk core disagrees with the other cores"
+
+print("\n=== Test 18: c=C degenerates to the pairwise core (single sub-block) ===")
+O_sc, S_sc = subchunk_gated_delta_rule_2(*inp, chunk_size=32, sub_chunk_size=32)
+O_pw, S_pw = pairwise_gated_delta_rule_2(*inp, chunk_size=32)
+e_o = report("subchunk(c=C) vs pairwise: O", O_sc, O_pw)
+e_s = report("subchunk(c=C) vs pairwise: S_final", S_sc, S_pw)
+assert e_o < 1e-6 and e_s < 1e-6, "c=C should reproduce the pairwise core"
 
 print("\nAll tests done.")
