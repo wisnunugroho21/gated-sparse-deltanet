@@ -9,10 +9,21 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", False)
 
+from functools import partial
+
 from rule import (
+    _batchify,
+    _chunkwise_single_pairwise,
     chunkwise_gated_delta_rule_2,
     recurrent_gated_delta_rule_2,
 )
+
+
+def pairwise_gated_delta_rule_2(*args, chunk_size=64):
+    """Batched wrapper around the pairwise log-space core (same I/O contract
+    as chunkwise_gated_delta_rule_2)."""
+    f = partial(_chunkwise_single_pairwise, chunk_size=chunk_size)
+    return _batchify(f)(*args)
 
 rng = np.random.default_rng(0)
 
@@ -163,5 +174,48 @@ for n, a_, b_ in zip(names, g_s, g_r):
     rel = err / (float(jnp.max(jnp.abs(b_))) + 1e-30)
     print(f"grad {n:4s}: finite={ok}  max_err_vs_recurrent={err:.3e}  rel={rel:.3e}")
     assert ok, f"non-finite grad {n}"
+
+print("\n=== Test 10: pairwise core vs recurrent, several chunk sizes ===")
+for C in (8, 16, 32, 64, 128):
+    O_pw, S_pw = pairwise_gated_delta_rule_2(*inp, chunk_size=C)
+    e_o = report(f"pairwise C={C}: O", O_pw, O_rec)
+    e_s = report(f"pairwise C={C}: S_final", S_pw, S_rec)
+    assert e_o < 1e-4 and e_s < 1e-4, f"pairwise mismatch at C={C}"
+
+print("\n=== Test 11: pairwise core is overflow-proof (beyond centered's ~176 limit) ===")
+for scale, C in [(3.0, 64), (5.0, 64), (10.0, 64)]:
+    inp_s = make_inputs(B=1, H=1, L=256, dk=16, dv=16, decay_scale=scale)
+    O_pw, S_pw = pairwise_gated_delta_rule_2(*inp_s, chunk_size=C)
+    O_ct, _ = chunkwise_gated_delta_rule_2(*inp_s, chunk_size=C)
+    O_rec_s, S_rec_s = recurrent_gated_delta_rule_2(*inp_s)
+    finite_pw = bool(jnp.all(jnp.isfinite(O_pw)) and jnp.all(jnp.isfinite(S_pw)))
+    finite_ct = bool(jnp.all(jnp.isfinite(O_ct)))
+    err = float(jnp.max(jnp.abs(O_pw - O_rec_s)))
+    rel = err / (float(jnp.max(jnp.abs(O_rec_s))) + 1e-30)
+    g_np = np.asarray(inp_s[3])[0, 0]
+    Gcum = np.concatenate([np.cumsum(g_np[i:i + C], axis=0) for i in range(0, 256, C)])
+    print(f"decay_scale={scale:5.1f}, C={C}: min within-chunk G={Gcum.min():8.1f}  "
+          f"pairwise finite={finite_pw} rel={rel:.3e}  (centered finite={finite_ct})")
+    assert finite_pw, f"pairwise non-finite at scale={scale}"
+    assert rel < 1e-4, f"pairwise inaccurate at scale={scale}: rel={rel}"
+
+print("\n=== Test 12: pairwise gradients under extreme decay (scale=5, C=64) ===")
+inp_s = make_inputs(B=1, H=2, L=256, dk=16, dv=16, decay_scale=5.0)
+g_pw = jax.grad(loss_fn(lambda *a: pairwise_gated_delta_rule_2(*a, chunk_size=64)))(inp_s)
+g_r = jax.grad(loss_fn(recurrent_gated_delta_rule_2))(inp_s)
+for n, a_, b_ in zip(names, g_pw, g_r):
+    ok = bool(jnp.all(jnp.isfinite(a_)))
+    err = float(jnp.max(jnp.abs(a_ - b_)))
+    rel = err / (float(jnp.max(jnp.abs(b_))) + 1e-30)
+    print(f"grad {n:4s}: finite={ok}  max_err_vs_recurrent={err:.3e}  rel={rel:.3e}")
+    assert ok, f"non-finite pairwise grad {n}"
+    assert rel < 1e-3, f"pairwise grad mismatch {n}: rel={rel}"
+
+print("\n=== Test 13: pairwise vs centered agree exactly in the safe regime ===")
+O_pw, S_pw = pairwise_gated_delta_rule_2(*inp, chunk_size=16)
+O_ct, S_ct = chunkwise_gated_delta_rule_2(*inp, chunk_size=16)
+e_o = report("pairwise vs centered: O", O_pw, O_ct)
+e_s = report("pairwise vs centered: S_final", S_pw, S_ct)
+assert e_o < 1e-4 and e_s < 1e-4, "pairwise and centered cores disagree"
 
 print("\nAll tests done.")
