@@ -25,6 +25,17 @@ Chunkwise WY form version (Eqs. 18-25 / 30-44):
     O     = Qgamma S0 + Aqk R                                      Eq. 24/44
     S_C   = diag(gamma_C) S0 + Ktail^T R                           Eq. 23/40
 
+Numerical-stability deviation from the paper's literal factors (exponent
+centering): gamma^{-1} = exp(-G) is unbounded, so materializing Kbar as
+written overflows fp32 once the within-chunk cumulative log-decay G drops
+below ~-88. Every product consumed downstream only involves the bounded
+ratios exp(G_r - G_s) (s <= r) and exp(G_C - G_r), so we shift all
+within-chunk exponents by c = G_C/2 per channel: the shift cancels exactly
+in T, Aqk, and Ktail, and is re-attached where an absolute gamma meets the
+state (Y S0, Qgamma S0) by pre-scaling S0 with diag(exp(c)), exp(c) <= 1.
+This doubles the safe per-chunk decay range to |G_C| ~ 176; beyond that,
+reduce chunk_size.
+
 The gate-aware backward (Eqs. 64-82, Appendix B) is intentionally NOT written:
 jax.grad differentiates straight through solve_triangular and the elementwise
 gate products and reconstructs exactly those vector-Jacobian products. The
@@ -83,24 +94,30 @@ def _chunkwise_single(
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive, within chunk)
     G = jnp.cumsum(g, axis=1)
 
-    # Eq. 18/30:  γ_r = exp(G_r)
-    gamma = jnp.exp(G)
+    # G_C, total chunk log-decay (last row of each chunk); Eq. 40/41
+    G_C = G[:, -1]  # [N, dk]
+    gamma_C = jnp.exp(G_C)
 
-    # γ_C, total chunk decay (last row of each chunk); Eq. 40/41
-    gamma_C = gamma[:, -1]  # [N, dk]
+    # Exponent centering (see module docstring): shift within-chunk exponents
+    # by c = G_C/2 per channel; Gc spans ±|G_C|/2 instead of [G_C, 0].
+    Gc = G - 0.5 * G_C[:, None, :]
+
+    # exp(c): per-chunk state pre-scale (≤ 1) that re-attaches the shift
+    delta = jnp.exp(0.5 * G_C)  # [N, dk]
 
     # --- Decay normalization (removes Diag(α) from the recurrence) ---
-    # Eq. 19/32/33:  K̄ = γ^{-1} ⊙ K  (exp(-G) = 1/γ in log-space)
-    Kbar = k * jnp.exp(-G)
+    # Eq. 19/32/33 centered:  K̄ = exp(c-G) ⊙ K  (paper: γ^{-1} ⊙ K)
+    Kbar = k * jnp.exp(-Gc)
 
-    # Eq. 20/33:     Ē = γ ⊙ (B ⊙ K);  b*k = e_r (Eq. 8), γ⊙ = ē_r (Eq. 19/32)
-    Ebar = gamma * (b * k)
+    # Eq. 20/33 centered:  Ē = exp(G-c) ⊙ (B ⊙ K);  b*k = e_r (Eq. 8)
+    Ebar = jnp.exp(Gc) * (b * k)
 
     # Eq. 8, 20/33:  Z = W ⊙ V  (z_r = w_r ⊙ v_r)
     Z = w * v
 
-    # Eq. 24/43:     Q_γ, row γ_r ⊙ q_r
-    Qg = gamma * q
+    # Eq. 24/43 centered:  Q_γ, row exp(G_r-c) ⊙ q_r; the missing exp(c)
+    # is restored by pairing with the pre-scaled state diag(exp(c)) S0
+    Qg = jnp.exp(Gc) * q
 
     # --- WY triangular solve (the parallelization) ---
     # Eq. 21/34, entry Eq. 87:  T = tril(Ē K̄ᵀ, -1), T_rs = ē_rᵀ k̄_s (s<r)
@@ -122,23 +139,28 @@ def _chunkwise_single(
     # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s  (tril incl. diag: s≤r)
     Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))  # [N, C, C]
 
-    # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r
-    Ktail = k * (gamma_C[:, None, :] / gamma)
+    # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r, formed in log-space as
+    # exp(G_C - G_r) — the ratio of two underflowed γ's would give 0/0
+    Ktail = k * jnp.exp(G_C[:, None, :] - G)
 
     # ---- Cross-chunk recurrence: the ONLY sequential part ---------------------
     # (Sec. 2.1 / Eq. 3 structure.) S is the raw chunk-entry state S_[n] (== S_0,
     # NOT decay-normalized); each step is three [C, d] x [d, d] matmuls.
     def chunk_step(
         S: jax.Array,
-        inp: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+        inp: tuple[jax.Array, ...],
     ) -> tuple[jax.Array, jax.Array]:
-        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
+        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n, delta_n = inp
+
+        # diag(exp(c)) S_0: re-attaches the centering shift so that
+        # Y (δ⊙S) == (A Ē) S_0 and Qg (δ⊙S) == Q_γ S_0 exactly
+        S_c = delta_n[:, None] * S
 
         # Eq. 35:     R = U − Y S_0  (stacked residual rows ρ_r, Eq. 37)
-        R = U_n - Y_n @ S
+        R = U_n - Y_n @ S_c
 
         # Eq. 24/44:  O = Q_γ S_0 + A_qk (U − Y S_0)
-        o = Qg_n @ S + Aqk_n @ R
+        o = Qg_n @ S_c + Aqk_n @ R
 
         # Eq. 23/40:  S_[n+1] = Diag(γ_C) S_0 + K_tailᵀ R
         # Diag(γ_C) S_0: broadcast over key-channel rows (decay lives on key axis)
@@ -146,7 +168,7 @@ def _chunkwise_single(
 
         return S_new, o
 
-    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
+    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C, delta))
     return o.reshape(L, dv), S_final
 
 
