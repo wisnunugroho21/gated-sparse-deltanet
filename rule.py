@@ -75,8 +75,8 @@ safer factorizations (see the strategy notes below):
     Qgamma  = gamma ⊙ Q             (decay-weighted queries)        Eq. 24/43
     T       = tril(Ebar Kbar^T, -1)                                 Eq. 21/34
     A       = (I + T)^{-1}          (unit lower-triangular solve)   Eq. 21/34
-    Y       = A Ebar                (WY auxiliaries)                Eq. 22/34
-    U       = A Z                   (WY auxiliaries)                Eq. 22/34
+    Y       = A Ebar                (WY auxiliaries — computed as   Eq. 22/34
+    U       = A Z                    ONE solve, stacked RHS [Ē|Z])  Eq. 22/34
     R       = U - Y S0              (the chunk's residual writes)   Eq. 35
     Aqk     = tril(Qgamma Kbar^T)                                   Eq. 25/43
     O       = Qgamma S0 + Aqk R                                     Eq. 24/44
@@ -94,7 +94,7 @@ Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
     Qgamma = gamma ⊙ Q            (decay-weighted queries)         Eq. 24/43
     T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
     A      = (I + T)^{-1}         (unit lower-triangular solve)    Eq. 21/34
-    Y, U   = A Ebar, A Z          (WY auxiliaries; share inverse)  Eq. 22/34
+    Y, U   = A Ebar, A Z          (one solve, stacked RHS [Ē|Z])   Eq. 22/34
     R      = U - Y S0             (the chunk's residual writes)    Eq. 35
     Aqk_rs = Σ_c Q_rc K_sc D_rsc,  s ≤ r                           Eq. 25/43
     O      = Qgamma S0 + Aqk R                                     Eq. 24/44
@@ -318,24 +318,22 @@ def _chunkwise_single_faithful(
     # write. Strictly lower triangular = causality (r only erases the past).
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
-    # Eq. 21/34:  A = (I + T)^{-1}.                                [N, C, C]
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z.
     # Residuals obey ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): each
     # edit first accounts for every earlier edit it partially erases.
-    # Stacked: (I + T) R = Z − Ē S0. I + T is unit lower-triangular, so one
-    # batched forward substitution replaces the C-step sequential recurrence.
-    A = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
+    # Stacked: (I + T) R = Z − Ē S0. I + T is unit lower-triangular, and Y
+    # and U solve the SAME system with different right-hand sides (row
+    # recurrences Eqs. 45/46), so ONE batched forward substitution over the
+    # stacked RHS [Ē | Z] yields both. The explicit inverse A = (I + T)^{-1}
+    # is never materialized: that would cost a C-RHS solve plus two matmuls
+    # and is numerically worse than solving directly.
+    # Both are independent of S0 — that is what lets all chunks precompute
+    # them in parallel before the sequential scan.
+    YU = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
+        lower=True, unit_diagonal=True,
     )
-
-    # Eq. 22/34:  Y = A Ē — erase-side auxiliary.                 [N, C, dk]
-    Y = A @ Ebar
-
-    # Eq. 22/34:  U = A Z — write-side auxiliary.                 [N, C, dv]
-    # Y and U solve the SAME triangular system with different right-hand
-    # sides (row recurrences Eqs. 45/46), sharing the one inverse A. Both
-    # are independent of S0 — that is what lets all chunks precompute them
-    # in parallel before the sequential scan.
-    U = A @ Z
+    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
 
     # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s.      [N, C, C]
     # Decay-aware causal attention scores: query r attends to the write at
@@ -476,18 +474,18 @@ def _chunkwise_single_centered(
     # Overlap of edit r with the decayed write s; centering cancels here.
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
-    # Eq. 21/34:  A = (I + T)^{-1} via one batched forward substitution —
-    # the closed form of the causal chain of corrections
-    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).           [N, C, C]
-    A = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē (erase side) and
+    # U = (I + T)^{-1} Z (write side) — the closed form of the causal chain
+    # of corrections ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).
+    # Same triangular system, two right-hand sides (Eqs. 45/46): one batched
+    # forward substitution over the stacked RHS [Ē | Z], no explicit inverse
+    # materialized. Both are S0-independent, hence precomputable for all
+    # chunks in parallel.
+    YU = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
+        lower=True, unit_diagonal=True,
     )
-
-    # Eq. 22/34:  Y = A Ē (erase side), U = A Z (write side) — same
-    # triangular system, two right-hand sides (Eqs. 45/46); both are
-    # S0-independent, hence precomputable for all chunks in parallel.
-    Y = A @ Ebar   # [N, C, dk]
-    U = A @ Z      # [N, C, dv]
+    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
 
     # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s.      [N, C, C]
     # Decay-aware causal scores; exp(Gc_r)·exp(−Gc_s) = exp(G_r − G_s), so
@@ -617,13 +615,6 @@ def _chunkwise_single_pairwise(
     # included: self-read, ratio = 1).                            [N, C, C]
     Aqk = jnp.einsum('nrc,nsc,nrsc->nrs', q, k, D_incl)
 
-    # Eq. 21/34:  A = (I + T)^{-1} via one batched forward substitution —
-    # the closed form of the causal chain of corrections
-    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).           [N, C, C]
-    A = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
-    )
-
     # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe;
     # no centering shift and no delta pre-scale are needed in this variant.
     # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)                                [N, C, dk]
@@ -635,11 +626,18 @@ def _chunkwise_single_pairwise(
     # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
     Z = w * v
 
-    # Eq. 22/34:  Y = A Ē (erase side), U = A Z (write side) — same
-    # triangular system, two right-hand sides (Eqs. 45/46); both are
-    # S0-independent, hence precomputable for all chunks in parallel.
-    Y = A @ Ebar   # [N, C, dk]
-    U = A @ Z      # [N, C, dv]
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē (erase side) and
+    # U = (I + T)^{-1} Z (write side) — the closed form of the causal chain
+    # of corrections ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).
+    # Same triangular system, two right-hand sides (Eqs. 45/46): one batched
+    # forward substitution over the stacked RHS [Ē | Z], no explicit inverse
+    # materialized. Both are S0-independent, hence precomputable for all
+    # chunks in parallel.
+    YU = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
+        lower=True, unit_diagonal=True,
+    )
+    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
 
     # Eq. 23/41:  (K_tail)_r = (γ_C/γ_r) ⊙ k_r, formed in log-space as
     # exp(G_C − G_r) ≤ 1.                                        [N, C, dk]
@@ -799,20 +797,21 @@ def _chunkwise_single_subchunking(
     Aqk = Aqk_off.at[:, rr, ss].add(Aqk_diag)  # Eq. 25/43        [N, C, C]
 
     # ---- From here on identical to the pairwise core ----------------------
-    # Eq. 21/34:  A = (I + T)^{-1} at FULL chunk size C — the sub-chunking
-    # only changed how T's entries were produced.                 [N, C, C]
-    A = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
-    )
-
     # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe.
     Ebar = jnp.exp(G) * e   # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)        [N, C, dk]
     Qg = jnp.exp(G) * q     # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
     Z = w * v               # Eq. 8, 20/33:  Z = W ⊙ V           [N, C, dv]
 
-    # Eq. 22/34:  WY auxiliaries, one shared inverse (Eqs. 45/46).
-    Y = A @ Ebar   # [N, C, dk]
-    U = A @ Z      # [N, C, dv]
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē, U = (I + T)^{-1} Z — the WY
+    # auxiliaries, solved at FULL chunk size C (the sub-chunking only
+    # changed how T's entries were produced). Same triangular system, two
+    # right-hand sides (Eqs. 45/46): one batched forward substitution over
+    # the stacked RHS [Ē | Z], no explicit inverse materialized.
+    YU = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
+        lower=True, unit_diagonal=True,
+    )
+    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
 
     # Eq. 23/41:  (K_tail)_r = exp(G_C − G_r) ⊙ k_r ≤ k_r.       [N, C, dk]
     Ktail = k * jnp.exp(G_C[:, None, :] - G)
