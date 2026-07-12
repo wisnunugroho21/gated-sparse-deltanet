@@ -84,6 +84,7 @@ safer factorizations (see the strategy notes below):
     S_C     = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
 
 --------- Optimization strategies ---------
+
 Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
     G_r    = cumsum(g)            (inclusive, within chunk)        Eq. 18/30
     gamma  = exp(G),  gamma_C = gamma[-1]  (total chunk decay)     Eq. 18/30
@@ -145,6 +146,8 @@ The hand-derived backward of Appendix B is intentionally not implemented:
 jax.grad differentiates through solve_triangular and the elementwise gate
 products and reconstructs exactly those vector-Jacobian products. A manual
 backward is only needed for a fused Triton/Pallas kernel.
+
+-------------------------------------------
 
 Shape conventions (one head): q, k, g, b: [L, dk]; v, w: [L, dv];
 S0: [dk, dv]. Public entry points add leading [B, H] axes via vmap.
@@ -884,43 +887,6 @@ def chunkwise_gated_delta_rule_2(
         So: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         return _chunkwise_single_centered(Q, K, V, G, B, W, So, chunk_size=chunk_size)
-
-    return _batchify(fun)(q, k, v, g, b, w, S0)
-
-def chunkwise_gated_delta_rule_2_1(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
-    b: jax.Array,
-    w: jax.Array,
-    S0: jax.Array,
-    chunk_size: int = 64,
-) -> tuple[jax.Array, jax.Array]:
-    """Chunkwise-parallel Gated Delta Rule-2 forward (training path).
-
-    Uses the exponent-centered core (_chunkwise_single_centered); safe for
-    per-chunk cumulative log-decay |G_C| up to ≈ 176 in fp32. For stronger
-    decay, reduce chunk_size, or switch cores: _chunkwise_single_subchunking
-    (unlimited range, matmul-dominated) or _chunkwise_single_pairwise
-    (unlimited range, simplest, ×C memory).
-
-    Args:
-      q, k, g, b: [B, H, L, dk]   v, w: [B, H, L, dv]   S0: [B, H, dk, dv]
-      chunk_size: intra-chunk length C (L divisible by C).
-    Returns:
-      (O: [B, H, L, dv], S_final: [B, H, dk, dv])
-    """
-    def fun(
-        Q: jax.Array,
-        K: jax.Array,
-        V: jax.Array,
-        G: jax.Array,
-        B: jax.Array,
-        W: jax.Array,
-        So: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        return _chunkwise_single_faithful(Q, K, V, G, B, W, So, chunk_size=chunk_size)
 
     return _batchify(fun)(q, k, v, g, b, w, S0)
 
