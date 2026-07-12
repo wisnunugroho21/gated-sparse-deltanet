@@ -21,14 +21,22 @@ The "-2" is the decoupling: classic (Gated) DeltaNet ties erase and write
 to one scalar β_r; here b (key side) and w (value side) are independent
 per-channel gates.
 
-Five implementations of the same recurrence:
+Six implementations of the same recurrence:
 
   _recurrent_single           token-by-token scan of Eq. 9/29. O(L·dk·dv),
                               trivially correct — the verification oracle.
   _chunkwise_single_faithful  chunkwise WY form exactly as printed in the
-                              paper (Eqs. 18-25 / 30-44). Overflows fp32
-                              when a chunk's cumulative log-decay G drops
-                              below ≈ −88 (it materializes exp(−G)).
+                              paper (Eqs. 18-25 / 30-44), including the
+                              explicit inverse A = (I + T)^{-1}. Overflows
+                              fp32 when a chunk's cumulative log-decay G
+                              drops below ≈ −88 (it materializes exp(−G)).
+  _chunkwise_single_stacked_RHS_solve
+                              faithful + the solver optimization: Y and U
+                              come from ONE triangular solve with stacked
+                              RHS [Ē|Z] instead of the explicit inverse.
+                              Same literal factors, same ≈ −88 overflow
+                              limit — the baseline the optimized cores
+                              below build on.
   _chunkwise_single_centered  same algebra with per-chunk exponent
                               centering: all within-chunk exponents are
                               shifted by c = G_C/2, which cancels exactly
@@ -75,8 +83,8 @@ safer factorizations (see the strategy notes below):
     Qgamma  = gamma ⊙ Q             (decay-weighted queries)        Eq. 24/43
     T       = tril(Ebar Kbar^T, -1)                                 Eq. 21/34
     A       = (I + T)^{-1}          (unit lower-triangular solve)   Eq. 21/34
-    Y       = A Ebar                (WY auxiliaries — computed as   Eq. 22/34
-    U       = A Z                    ONE solve, stacked RHS [Ē|Z])  Eq. 22/34
+    Y       = A Ebar                (erase-side WY auxiliary)       Eq. 22/34
+    U       = A Z                   (write-side WY auxiliary)       Eq. 22/34
     R       = U - Y S0              (the chunk's residual writes)   Eq. 35
     Aqk     = tril(Qgamma Kbar^T)                                   Eq. 25/43
     O       = Qgamma S0 + Aqk R                                     Eq. 24/44
@@ -85,34 +93,35 @@ safer factorizations (see the strategy notes below):
 
 --------- Optimization strategies ---------
 
-Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
-    G_r    = cumsum(g)            (inclusive, within chunk)        Eq. 18/30
-    gamma  = exp(G),  gamma_C = gamma[-1]  (total chunk decay)     Eq. 18/30
-    D_rsc  = exp(G_rc - G_sc)·1[s≤r]  (pairwise decay ratios)      from Eq. 19/32
-    Ebar   = gamma ⊙ (B ⊙ K)      (decay-absorbed erase factor)    Eq. 20/33
-    Z      = W ⊙ V                (gated write targets)            Eq. 20/33
-    Qgamma = gamma ⊙ Q            (decay-weighted queries)         Eq. 24/43
-    T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
-    A      = (I + T)^{-1}         (unit lower-triangular solve)    Eq. 21/34
-    Y, U   = A Ebar, A Z          (one solve, stacked RHS [Ē|Z])   Eq. 22/34
-    R      = U - Y S0             (the chunk's residual writes)    Eq. 35
-    Aqk_rs = Σ_c Q_rc K_sc D_rsc,  s ≤ r                           Eq. 25/43
-    O      = Qgamma S0 + Aqk R                                     Eq. 24/44
-    Ktail  = exp(G_C - G) ⊙ K     (tail-decayed keys)              Eq. 23/41
-    S_C    = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
+Two independent optimizations distinguish the chunkwise cores.
 
-Define the pairwise decay ratios
+(a) SOLVER. Y and U solve the SAME unit lower-triangular system
+    (I + T) X = RHS with right-hand sides Ē and Z (Eqs. 45/46). The
+    faithful core materializes the explicit inverse A = (I + T)^{-1} and
+    multiplies twice, as the paper writes it; every other chunkwise core
+    uses ONE forward substitution over the stacked RHS [Ē | Z] — fewer
+    flops (a (dk+dv)-RHS solve replaces a C-RHS solve plus two matmuls),
+    one less [C, C] intermediate, and better numerics than multiplying by
+    an explicitly formed inverse.
 
-    D_rsc = exp(G_rc - G_sc) · 1[s ≤ r]     (pair (r, s), key channel c)
+(b) DECAY FACTORIZATION. Define the pairwise decay ratios
 
-— the only decay factors T and A_qk actually consume. Together with the
-tail/carry ratios exp(G_C − G_r) and exp(G_C), every one of them has
-exponent ≤ 0, so the exact math is overflow-free; overflow can only enter
-through HOW a core factorizes D_rsc into materialized tensors. The four
-chunkwise cores differ ONLY in that choice:
+        D_rsc = exp(G_rc - G_sc) · 1[s ≤ r]   (pair (r, s), key channel c)
 
-_chunkwise_single_centered — same split, exponents shifted by c = G_C/2
-per channel (matmuls; range doubles to |G_C| ~ 176):
+    — the only decay factors T and A_qk actually consume. Together with
+    the tail/carry ratios exp(G_C − G_r) and exp(G_C), every one of them
+    has exponent ≤ 0, so the exact math is overflow-free; overflow can
+    only enter through HOW a core factorizes D_rsc into materialized
+    tensors. The optimized cores differ in that choice:
+
+_chunkwise_single_stacked_RHS_solve — (a) only; keeps the paper's literal
+factors, so the ≈ 88 overflow limit remains:
+    D_rsc  = exp(G_rc)·exp(-G_sc)     (the exp(-G) half still overflows)
+    [Y|U]  = (I + T)^{-1} [Ē|Z]       (one solve, stacked RHS)
+
+_chunkwise_single_centered — (a) + the faithful exp(G_r)·exp(-G_s) split
+with exponents shifted by c = G_C/2 per channel (matmuls; range doubles
+to |G_C| ~ 176):
     Gc     = G - G_C/2            (spans ±|G_C|/2, not [G_C, 0])
     delta  = exp(G_C/2) <= 1      (re-attaches the shift to S0)
     Kbar   = exp(-Gc) ⊙ K,   Ebar_c = exp(Gc) ⊙ (B ⊙ K),
@@ -122,17 +131,17 @@ per channel (matmuls; range doubles to |G_C| ~ 176):
     R      = U - Y (delta ⊙ S0),  O = Qg_c (delta ⊙ S0) + Aqk R
              (delta ⊙ S0 restores Y S0 and Qgamma S0 exactly)      Eq. 35, 24/44
 
-_chunkwise_single_pairwise — every triple formed directly (einsums over a
-[N, C, C, dk] tensor; no range limit, x C memory):
+_chunkwise_single_pairwise — (a) + every triple formed directly (einsums
+over a [N, C, C, dk] tensor; no range limit, x C memory):
     D_rsc  = exp(G_rc - G_sc)·1[s≤r]   (mask BEFORE exp: anti-causal
              exponents are ≥ 0 and would give inf·0 = NaN after)
     T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
     Aqk_rs = Σ_c Q_rc K_sc D_rsc,      s ≤ r                       Eq. 25/43
     Ebar, Qgamma, Ktail as in the shared form (exponents ≤ 0, safe)
 
-_chunkwise_single_subchunking — M = C/c sub-blocks, decay factored through
-each row-block's entry boundary B_i = G at the last position before block
-i (matmul-dominated; no range limit, x C/c memory):
+_chunkwise_single_subchunking — (a) + M = C/c sub-blocks, decay factored
+through each row-block's entry boundary B_i = G at the last position
+before block i (matmul-dominated; no range limit, x C/c memory):
     off-diagonal (r in block i, s in block j < i):
         D_rsc = exp(G_rc - B_ic)·exp(B_ic - G_sc)   (s ≤ bnd ≤ r, so
                 BOTH exponents ≤ 0; batched matmuls per row-block)
@@ -160,6 +169,7 @@ from jax import lax
 
 # Compute dtype for all internal math (paper App. D: gate/decay math in fp32).
 D_TYPE = jnp.float32
+
 
 def _recurrent_single(
     q: jax.Array,
@@ -246,9 +256,12 @@ def _chunkwise_single_faithful(
     """Chunkwise WY forward for ONE (batch, head) pair, literal paper form.
 
     Implements Eqs. 18-25 (main text) = Eqs. 30-44 (App. A) with the exact
-    factors printed in the paper. Kept as a readable reference; it
-    materializes exp(-G), so it overflows fp32 once the within-chunk
-    cumulative log-decay G goes below ≈ -88. Prefer _chunkwise_single_centered.
+    factors printed in the paper, including the explicit inverse
+    A = (I + T)^{-1}. Kept as a readable reference; it materializes
+    exp(-G), so it overflows fp32 once the within-chunk cumulative
+    log-decay G goes below ≈ -88. _chunkwise_single_stacked_RHS_solve is
+    this core with only the solver improved; _chunkwise_single_centered is
+    the production default.
 
     Args:
       q, k, g, b: [L, dk]   query / key / log-decay (g ≤ 0) / erase gate
@@ -261,6 +274,9 @@ def _chunkwise_single_faithful(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
+    if L % C:
+        raise ValueError(
+            f"sequence length L={L} must be divisible by chunk_size={C}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -392,6 +408,7 @@ def _chunkwise_single_faithful(
     S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
     return o.reshape(L, dv), S_final
 
+
 def _chunkwise_single_stacked_RHS_solve(
     q: jax.Array,
     k: jax.Array,
@@ -402,9 +419,35 @@ def _chunkwise_single_stacked_RHS_solve(
     S0: jax.Array,
     chunk_size: int,
 ) -> tuple[jax.Array, jax.Array]:
+    """Chunkwise WY forward for ONE (batch, head) pair: literal paper
+    factors + stacked-RHS solver.
+
+    Identical to _chunkwise_single_faithful in every decay factor — it
+    keeps the paper's literal K̄ = exp(−G) ⊙ K and the γ_C/γ ratio for
+    K_tail, and therefore shares the same fp32 limits (overflow once the
+    within-chunk cumulative log-decay |G_C| > ≈ 88) — but computes the WY
+    auxiliaries with ONE triangular solve over the stacked right-hand side,
+
+        [Y | U] = (I + T)^{-1} [Ē | Z]        (Eqs. 22/34, 45/46)
+
+    instead of materializing the explicit inverse A = (I + T)^{-1} and
+    multiplying twice. That is fewer flops (a (dk+dv)-RHS solve replaces a
+    C-RHS solve plus two [C,C] @ [C,d] matmuls), one less [C, C]
+    intermediate per chunk, and better numerics than multiplying by an
+    explicitly formed inverse.
+
+    This core isolates the SOLVER optimization from the NUMERICAL-RANGE
+    ones: diffing it against faithful shows exactly the stacked-RHS change,
+    and the centered/pairwise/subchunking cores all build on it.
+
+    Args / returns: identical to _chunkwise_single_faithful.
+    """
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
+    if L % C:
+        raise ValueError(
+            f"sequence length L={L} must be divisible by chunk_size={C}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -568,6 +611,9 @@ def _chunkwise_single_centered(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
+    if L % C:
+        raise ValueError(
+            f"sequence length L={L} must be divisible by chunk_size={C}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -713,6 +759,9 @@ def _chunkwise_single_pairwise(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
+    if L % C:
+        raise ValueError(
+            f"sequence length L={L} must be divisible by chunk_size={C}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -766,11 +815,14 @@ def _chunkwise_single_pairwise(
 
     # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe;
     # no centering shift and no delta pre-scale are needed in this variant.
+    # Eq. 18/30:  γ = exp(G), computed once and shared by Ē and Q_γ.
+    gamma = jnp.exp(G)  # [N, C, dk]
+
     # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)                                [N, C, dk]
-    Ebar = jnp.exp(G) * (b * k)
+    Ebar = gamma * (b * k)
 
     # Eq. 24/43:  Q_γ, row r = γ_r ⊙ q_r                          [N, C, dk]
-    Qg = jnp.exp(G) * q
+    Qg = gamma * q
 
     # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
     Z = w * v
@@ -867,6 +919,12 @@ def _chunkwise_single_subchunking(
     dv = v.shape[-1]
     C = chunk_size
     c = sub_chunk_size
+    if L % C:
+        raise ValueError(
+            f"sequence length L={L} must be divisible by chunk_size={C}")
+    if C % c:
+        raise ValueError(
+            f"chunk_size={C} must be divisible by sub_chunk_size={c}")
     N = L // C   # number of chunks
     M = C // c   # sub-blocks per chunk
 
@@ -925,16 +983,25 @@ def _chunkwise_single_subchunking(
 
     # DIAGONAL c×c blocks: pairwise log-space differences within each
     # sub-block (B_i cancels: Grel_r − Grel_s = G_r − G_s). Exponents ≤ 0
-    # under the causal masks, applied before the exp as in the pairwise
-    # core.                                              Gd: [N, M, c, c, dk]
+    # under the causal mask, applied before the exp as in the pairwise
+    # core. Only the inclusive (s ≤ r) decay tensor is materialized: its
+    # strict counterpart differs only on the diagonal, where
+    # D_incl = exp(0) = 1 (finite, no inf·0 hazard), so T_diag is built
+    # with D_incl and the s = r scores are discarded by a strict tril on
+    # the small [N, M, c, c] result.                     Gd: [N, M, c, c, dk]
     Gd = Grel[:, :, :, None, :] - Grel[:, :, None, :, :]
-    strict = jnp.tril(jnp.ones((c, c), dtype=bool), k=-1)   # s <  r (Eq. 21/34)
-    causal = jnp.tril(jnp.ones((c, c), dtype=bool))         # s <= r (Eq. 25/43)
-    D_strict = jnp.exp(jnp.where(strict[None, None, :, :, None], Gd, neg_inf))
-    D_incl = jnp.exp(jnp.where(causal[None, None, :, :, None], Gd, neg_inf))
+    causal = jnp.tril(
+        jnp.ones((c, c), dtype=bool)
+    )       # s <= r
+    D_incl = jnp.exp(
+        jnp.where(causal[None, None, :, :, None], Gd, neg_inf)
+    )
     kg = k.reshape(N, M, c, dk)
-    T_diag = jnp.einsum('nmrc,nmsc,nmrsc->nmrs',
-                        e.reshape(N, M, c, dk), kg, D_strict)   # [N, M, c, c]
+    T_diag = jnp.tril(
+        jnp.einsum(
+            'nmrc,nmsc,nmrsc->nmrs',
+            e.reshape(N, M, c, dk), kg, D_incl),
+        k=-1)                                                   # [N, M, c, c]
     Aqk_diag = jnp.einsum('nmrc,nmsc,nmrsc->nmrs',
                           q.reshape(N, M, c, dk), kg, D_incl)   # [N, M, c, c]
 
@@ -947,8 +1014,9 @@ def _chunkwise_single_subchunking(
 
     # ---- From here on identical to the pairwise core ----------------------
     # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe.
-    Ebar = jnp.exp(G) * e   # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)        [N, C, dk]
-    Qg = jnp.exp(G) * q     # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
+    gamma = jnp.exp(G)      # Eq. 18/30:  γ = exp(G), shared     [N, C, dk]
+    Ebar = gamma * e        # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)        [N, C, dk]
+    Qg = gamma * q          # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
     Z = w * v               # Eq. 8, 20/33:  Z = W ⊙ V           [N, C, dv]
 
     # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē, U = (I + T)^{-1} Z — the WY
@@ -1001,6 +1069,18 @@ def _batchify(fn):
     return jax.vmap(over_heads, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
 
 
+# Registry backing the public entry point's core= selector. Keys are the
+# accepted `core` names; see chunkwise_gated_delta_rule_2 for guidance on
+# choosing one.
+_CHUNKWISE_CORES = {
+    "faithful": _chunkwise_single_faithful,
+    "stacked_rhs": _chunkwise_single_stacked_RHS_solve,
+    "centered": _chunkwise_single_centered,
+    "pairwise": _chunkwise_single_pairwise,
+    "subchunking": _chunkwise_single_subchunking,
+}
+
+
 def chunkwise_gated_delta_rule_2(
     q: jax.Array,
     k: jax.Array,
@@ -1010,21 +1090,34 @@ def chunkwise_gated_delta_rule_2(
     w: jax.Array,
     S0: jax.Array,
     chunk_size: int = 64,
+    core: str = "centered",
+    sub_chunk_size: int = 16,
 ) -> tuple[jax.Array, jax.Array]:
     """Chunkwise-parallel Gated Delta Rule-2 forward (training path).
 
-    Uses the exponent-centered core (_chunkwise_single_centered); safe for
-    per-chunk cumulative log-decay |G_C| up to ≈ 176 in fp32. For stronger
-    decay, reduce chunk_size, or switch cores: _chunkwise_single_subchunking
-    (unlimited range, matmul-dominated) or _chunkwise_single_pairwise
-    (unlimited range, simplest, ×C memory).
-
     Args:
       q, k, g, b: [B, H, L, dk]   v, w: [B, H, L, dv]   S0: [B, H, dk, dv]
-      chunk_size: intra-chunk length C (L divisible by C).
+      chunk_size: intra-chunk length C (L must be divisible by C).
+      core: which chunkwise core computes each head —
+        "centered"     (default) exponent-centered matmuls; safe for
+                       per-chunk cumulative log-decay |G_C| up to ≈ 176.
+        "subchunking"  GLA-style secondary chunking; NO decay-range limit,
+                       matmul-dominated; tuned by sub_chunk_size.
+        "pairwise"     per-triple log-space decay; NO range limit but ×C
+                       memory on the score path — verification / fallback.
+        "stacked_rhs"  the paper's literal factors + stacked-RHS solver;
+                       overflows past |G_C| ≈ 88 — reference.
+        "faithful"     the paper's equations verbatim (explicit inverse);
+                       overflows past |G_C| ≈ 88 — reference.
+      sub_chunk_size: c for core="subchunking" (must divide chunk_size);
+                      ignored by every other core.
     Returns:
       (O: [B, H, L, dv], S_final: [B, H, dk, dv])
     """
+    if core not in _CHUNKWISE_CORES:
+        raise ValueError(
+            f"core={core!r} is not one of {sorted(_CHUNKWISE_CORES)}")
+
     def fun(
         Q: jax.Array,
         K: jax.Array,
@@ -1034,7 +1127,12 @@ def chunkwise_gated_delta_rule_2(
         W: jax.Array,
         So: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        return _chunkwise_single_centered(Q, K, V, G, B, W, So, chunk_size=chunk_size)
+        if core == "subchunking":
+            return _chunkwise_single_subchunking(
+                Q, K, V, G, B, W, So,
+                chunk_size=chunk_size, sub_chunk_size=sub_chunk_size)
+        return _CHUNKWISE_CORES[core](
+            Q, K, V, G, B, W, So, chunk_size=chunk_size)
 
     return _batchify(fun)(q, k, v, g, b, w, S0)
 
