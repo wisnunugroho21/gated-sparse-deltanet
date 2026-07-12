@@ -62,7 +62,10 @@ lower-triangular system (I + T) R = Z − Ē S0 (Eq. 39), solved by forward
 substitution; the output and end-of-chunk state are then dense matmuls.
 Only the cross-chunk state remains sequential.
 
-Chunkwise WY form (Eqs. 18-25 / 30-44):
+Chunkwise WY form (Eqs. 18-25 / 30-44), written in the paper's literal
+factors — the reference realization that _chunkwise_single_faithful
+implements verbatim; the other cores compute the same quantities with
+safer factorizations (see the strategy notes below):
     G_r     = cumsum(g)             (inclusive, within chunk)       Eq. 18/30
     gamma   = exp(G)                                                Eq. 18/30
     gamma_C = gamma[-1]             (total chunk decay)             Eq. 18/30
@@ -80,20 +83,32 @@ Chunkwise WY form (Eqs. 18-25 / 30-44):
     Ktail   = exp(G_C - G) ⊙ K      (tail-decayed keys)             Eq. 23/41
     S_C     = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
 
-For the optimization strategy,
-Every decay factor the algorithm consumes is a D_rsc ratio (or the
-tail/carry ratios exp(G_C − G_r), exp(G_C)), all with exponent ≤ 0. The
-four chunkwise cores differ ONLY in how the D_rsc inside T and A_qk are
-realized:
+--------- Optimization strategies ---------
+Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
+    G_r    = cumsum(g)            (inclusive, within chunk)        Eq. 18/30
+    gamma  = exp(G),  gamma_C = gamma[-1]  (total chunk decay)     Eq. 18/30
+    D_rsc  = exp(G_rc - G_sc)·1[s≤r]  (pairwise decay ratios)      from Eq. 19/32
+    Ebar   = gamma ⊙ (B ⊙ K)      (decay-absorbed erase factor)    Eq. 20/33
+    Z      = W ⊙ V                (gated write targets)            Eq. 20/33
+    Qgamma = gamma ⊙ Q            (decay-weighted queries)         Eq. 24/43
+    T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
+    A      = (I + T)^{-1}         (unit lower-triangular solve)    Eq. 21/34
+    Y, U   = A Ebar, A Z          (WY auxiliaries; share inverse)  Eq. 22/34
+    R      = U - Y S0             (the chunk's residual writes)    Eq. 35
+    Aqk_rs = Σ_c Q_rc K_sc D_rsc,  s ≤ r                           Eq. 25/43
+    O      = Qgamma S0 + Aqk R                                     Eq. 24/44
+    Ktail  = exp(G_C - G) ⊙ K     (tail-decayed keys)              Eq. 23/41
+    S_C    = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
 
-_chunkwise_single_faithful — the paper's literal split (matmuls; the
-exp(-G) half is unbounded, overflows fp32 once |G_C| > ~88):
-    Kbar   = exp(-G) ⊙ K          (the overflow source)            Eq. 19/33
-    D_rsc  = exp(G_rc)·exp(-G_sc)                                  Eq. 19/32
-    T      = tril(Ebar Kbar^T, -1)                                 Eq. 21/34
-    Aqk    = tril(Qgamma Kbar^T)                                   Eq. 25/43
-    Ktail  = (gamma_C / gamma) ⊙ K  (literal ratio: 0/0 = NaN
-                                     once both gammas underflow)   Eq. 23/41
+Define the pairwise decay ratios
+
+    D_rsc = exp(G_rc - G_sc) · 1[s ≤ r]     (pair (r, s), key channel c)
+
+— the only decay factors T and A_qk actually consume. Together with the
+tail/carry ratios exp(G_C − G_r) and exp(G_C), every one of them has
+exponent ≤ 0, so the exact math is overflow-free; overflow can only enter
+through HOW a core factorizes D_rsc into materialized tensors. The four
+chunkwise cores differ ONLY in that choice:
 
 _chunkwise_single_centered — same split, exponents shifted by c = G_C/2
 per channel (matmuls; range doubles to |G_C| ~ 176):
@@ -869,6 +884,43 @@ def chunkwise_gated_delta_rule_2(
         So: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         return _chunkwise_single_centered(Q, K, V, G, B, W, So, chunk_size=chunk_size)
+
+    return _batchify(fun)(q, k, v, g, b, w, S0)
+
+def chunkwise_gated_delta_rule_2_1(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    S0: jax.Array,
+    chunk_size: int = 64,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunkwise-parallel Gated Delta Rule-2 forward (training path).
+
+    Uses the exponent-centered core (_chunkwise_single_centered); safe for
+    per-chunk cumulative log-decay |G_C| up to ≈ 176 in fp32. For stronger
+    decay, reduce chunk_size, or switch cores: _chunkwise_single_subchunking
+    (unlimited range, matmul-dominated) or _chunkwise_single_pairwise
+    (unlimited range, simplest, ×C memory).
+
+    Args:
+      q, k, g, b: [B, H, L, dk]   v, w: [B, H, L, dv]   S0: [B, H, dk, dv]
+      chunk_size: intra-chunk length C (L divisible by C).
+    Returns:
+      (O: [B, H, L, dv], S_final: [B, H, dk, dv])
+    """
+    def fun(
+        Q: jax.Array,
+        K: jax.Array,
+        V: jax.Array,
+        G: jax.Array,
+        B: jax.Array,
+        W: jax.Array,
+        So: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return _chunkwise_single_faithful(Q, K, V, G, B, W, So, chunk_size=chunk_size)
 
     return _batchify(fun)(q, k, v, g, b, w, S0)
 

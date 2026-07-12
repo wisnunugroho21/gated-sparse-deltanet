@@ -16,6 +16,7 @@ from rule import (
     _chunkwise_single_pairwise,
     _chunkwise_single_subchunking,
     chunkwise_gated_delta_rule_2,
+    chunkwise_gated_delta_rule_2_1,
     recurrent_gated_delta_rule_2,
 )
 
@@ -93,6 +94,12 @@ e2 = report("recurrent vs naive: S_final", S_rec, jnp.asarray(S_naive, jnp.float
 print("\n=== Test 2: chunkwise vs recurrent, several chunk sizes ===")
 for C in (8, 16, 32, 64, 128):
     O_ch, S_ch = chunkwise_gated_delta_rule_2(*inp, chunk_size=C)
+    report(f"C={C}: O", O_ch, O_rec)
+    report(f"C={C}: S_final", S_ch, S_rec)
+
+print("\n=== Test 2: centered vs recurrent, several chunk sizes ===")
+for C in (8, 16, 32, 64, 128):
+    O_ch, S_ch = chunkwise_gated_delta_rule_2_1(*inp, chunk_size=C)
     report(f"C={C}: O", O_ch, O_rec)
     report(f"C={C}: S_final", S_ch, S_rec)
 
