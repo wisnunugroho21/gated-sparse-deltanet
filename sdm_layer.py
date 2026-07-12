@@ -43,11 +43,18 @@ Parameterization notes (Sec. 3.2 / 3.3 / 4):
   * M₀ init: zeros (empty memory; the paper does not specify — zeros makes
     the null-M₀ ablation the exact same model at step 0).
 
-Scope: recurrent (scan) execution only — training AND streaming both run
-the token-by-token core (sdm_rule.py). The chunkwise-parallel training
-path (paper App. A) is future work. Memory cost: the state is
-H·N·dv floats PER SEQUENCE — e.g. √N=64, dv=128, H=1 is 2 MB fp32; the
-paper-scale √N=1024 is 512 MB. Size sqrt_n to your hardware.
+Execution cores (core=): "recurrent" (default) scans token-by-token — no
+length constraint, the oracle; "chunkwise" runs the chunkwise-parallel WY
+core (paper App. A; sdm_rule.chunkwise_sdm) — sequential depth L/C
+instead of L, requires L % chunk_size == 0 in __call__. step() mirrors
+the GDN-2 layer: with core="chunkwise" the chunk-aligned prefix takes the
+parallel core and the ragged tail (incl. L=1 decode) the recurrent one;
+both compute the same recurrence, so the split is invisible.
+
+Memory cost: the state is H·N·dv floats PER SEQUENCE — e.g. √N=64,
+dv=128, H=1 is 2 MB fp32; the paper-scale √N=1024 is 512 MB. Size sqrt_n
+to your hardware. The chunkwise core additionally materializes
+[C, C, W, W] index-match tensors per chunk (see sdm_rule.py).
 """
 
 from typing import NamedTuple
@@ -58,7 +65,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from layer import GatedRMSNorm
-from sdm_rule import recurrent_sdm
+from sdm_rule import chunkwise_sdm, recurrent_sdm
 
 F32 = jnp.float32
 
@@ -90,6 +97,8 @@ class SparseDeltaMemory(nnx.Module):
         head_v_dim: int = 128,  # d_v per head
         learned_init: bool = True,  # learned M₀ (paper default, Sec. 3.1)
         compute_dtype: jnp.dtype = jnp.float32,
+        core: str = "recurrent",  # "recurrent" (oracle) or "chunkwise" (App. A)
+        chunk_size: int = 64,  # C for core="chunkwise"; ignored otherwise
         *,
         rngs: nnx.Rngs,
     ):
@@ -108,6 +117,9 @@ class SparseDeltaMemory(nnx.Module):
         assert self.sqrt_n >= 2, "sqrt_n must be >= 2 (N = sqrt_n**2 slots)"
         assert 1 <= self.W <= self.N, "num_writes must be in [1, N]"
         assert 1 <= self.R <= self.N, "num_reads must be in [1, N]"
+        assert core in ("recurrent", "chunkwise"), f"unknown core {core!r}"
+        self.core = core
+        self.chunk_size = chunk_size
 
         v_proj_dim = self.H * self.dv
 
@@ -289,10 +301,13 @@ class SparseDeltaMemory(nnx.Module):
         """Full-sequence forward. x: [B, L, d_model] -> out: [B, L, d_model],
         or (out, M_final) with return_state=True.
 
-        No chunk-size constraint (the core is a token scan). `initial_state`
-        / M_final are [B, H, N, dv]; passing one OVERRIDES the learned M₀ —
-        state carried across segment calls is EXACT here (no conv caveat,
-        unlike the GDN-2 layer: an SDM layer's entire state is the table)."""
+        core="recurrent" has no length constraint; core="chunkwise"
+        requires L % chunk_size == 0 (the core validates and raises) — pad
+        training batches to a multiple of C, or use `step`, which handles
+        ragged lengths via its recurrent tail. `initial_state` / M_final
+        are [B, H, N, dv]; passing one OVERRIDES the learned M₀ — state
+        carried across segment calls is EXACT here (no conv caveat, unlike
+        the GDN-2 layer: an SDM layer's entire state is the table)."""
         B, _, _ = x.shape
         iw, kw, ir, qr, v, g, beta = self._project(x)
 
@@ -301,7 +316,11 @@ class SparseDeltaMemory(nnx.Module):
             if initial_state is None
             else initial_state.astype(F32)
         )
-        y, M_final = recurrent_sdm(iw, kw, ir, qr, v, g, beta, M0)
+        if self.core == "chunkwise":
+            y, M_final = chunkwise_sdm(
+                iw, kw, ir, qr, v, g, beta, M0, chunk_size=self.chunk_size)
+        else:
+            y, M_final = recurrent_sdm(iw, kw, ir, qr, v, g, beta, M0)
 
         out = self._output(y, x)
         if return_state:
@@ -322,8 +341,46 @@ class SparseDeltaMemory(nnx.Module):
 
     def step(self, x: jax.Array, cache: SDMCache) -> tuple[jax.Array, SDMCache]:
         """Streaming forward. x: [B, L, d_model] (any L ≥ 1).
-        Returns (out, new_cache). Exactly equals the corresponding slice of
-        a full __call__ — there is no conv context, so segmentation is
-        invisible (verified in test_sdm_layer.py)."""
-        out, M = self(x, initial_state=cache.memory, return_state=True)
-        return out, SDMCache(memory=M)
+        Returns (out, new_cache). Equals the corresponding slice of a full
+        pass — there is no conv context, so segmentation is invisible
+        (verified in test_sdm_layer.py).
+
+        With core="chunkwise" the length splits as L = n_full + tail
+        (n_full = (L // C)·C): the aligned prefix runs the parallel
+        chunkwise core (fast prefill), the ragged tail — including the
+        L=1 decode step — the recurrent core, both threading the same
+        memory table (the GDN-2 layer's step pattern). With
+        core="recurrent" everything takes the recurrent core."""
+        iw, kw, ir, qr, v, g, beta = self._project(x)
+        M = cache.memory.astype(F32)
+
+        L = x.shape[1]
+        n_full = (
+            (L // self.chunk_size) * self.chunk_size
+            if self.core == "chunkwise"
+            else 0
+        )
+        outs = []
+
+        if n_full > 0:
+            # Chunkwise prefill of the aligned prefix, warm-started from —
+            # and updating — the running memory table.
+            y_head, M = chunkwise_sdm(
+                iw[:, :, :n_full], kw[:, :, :n_full],
+                ir[:, :, :n_full], qr[:, :, :n_full],
+                v[:, :, :n_full], g[:, :, :n_full], beta[:, :, :n_full],
+                M, chunk_size=self.chunk_size)
+            outs.append(y_head)
+
+        if n_full < L:
+            # Ragged tail (or the whole input when L < C, e.g. decode):
+            # recurrent core, token-by-token.
+            y_tail, M = recurrent_sdm(
+                iw[:, :, n_full:], kw[:, :, n_full:],
+                ir[:, :, n_full:], qr[:, :, n_full:],
+                v[:, :, n_full:], g[:, :, n_full:], beta[:, :, n_full:],
+                M)
+            outs.append(y_tail)
+
+        y = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=2)
+        return self._output(y, x), SDMCache(memory=M)

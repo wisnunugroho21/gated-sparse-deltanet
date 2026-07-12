@@ -12,17 +12,9 @@ jax.config.update("jax_enable_x64", False)
 from jax import lax
 
 from rule import recurrent_gated_delta_rule_2
-from sdm_rule import recurrent_sdm
+from sdm_rule import chunkwise_sdm, recurrent_sdm
 
 rng = np.random.default_rng(0)
-
-
-def rand_idx(B, H, L, k, N):
-    """Distinct slot indices per token — the product-key selection
-    guarantee the core's scatter relies on."""
-    idx = np.stack([rng.choice(N, size=k, replace=False)
-                    for _ in range(B * H * L)])
-    return jnp.asarray(idx.reshape(B, H, L, k).astype(np.int32))
 
 
 def rand_val(B, H, L, k):
@@ -33,16 +25,21 @@ def rand_val(B, H, L, k):
 
 
 def make_inputs(B=2, H=3, L=64, N=64, W=8, R=8, dv=16, decay_scale=0.3,
-                write_pool=None):
-    """write_pool restricts write indices to slots [0, write_pool) —
-    used by the untouched-slot test."""
+                write_pool=None, read_pool=None):
+    """write_pool / read_pool restrict indices to slots [0, pool) — small
+    pools force heavy slot collisions across tokens (deep segmented-decay
+    chains and dense index-match interactions in the chunkwise core)."""
     pool = write_pool or N
     iw = jnp.asarray(
         np.stack([rng.choice(pool, size=W, replace=False)
                   for _ in range(B * H * L)]
                  ).reshape(B, H, L, W).astype(np.int32))
     kw = rand_val(B, H, L, W)
-    ir = rand_idx(B, H, L, R, N)
+    rpool = read_pool or N
+    ir = jnp.asarray(
+        np.stack([rng.choice(rpool, size=R, replace=False)
+                  for _ in range(B * H * L)]
+                 ).reshape(B, H, L, R).astype(np.int32))
     qr = rand_val(B, H, L, R)
     v = jnp.asarray(rng.standard_normal((B, H, L, dv)).astype(np.float32))
     g = jnp.asarray(
@@ -204,5 +201,72 @@ for n, a_, b_ in zip(["dkw", "dqr", "dv", "dg", "dbeta", "dM0"], g_sp, g_de):
     e = report(f"grad {n}", a_, b_)
     assert bool(jnp.all(jnp.isfinite(a_))), f"non-finite grad {n}"
     assert e < 1e-3, f"grad mismatch {n}"
+
+print("\n=== Test 6: chunkwise vs recurrent, several chunk sizes ===")
+for C in (1, 8, 16, 32, 64):
+    y_ch, M_ch = chunkwise_sdm(*inp, chunk_size=C)
+    e1 = report(f"C={C}: y", y_ch, y_sdm)
+    e2 = report(f"C={C}: M_final", M_ch, M_sdm)
+    assert e1 < 1e-3 and e2 < 1e-3, f"chunkwise mismatch at C={C}"
+
+print("\n=== Test 7: heavy slot collisions (small pools) + zero init state ===")
+# write_pool = read_pool = 8 with W = R = 8: EVERY token rewrites and
+# rereads the same 8 slots — maximal index-match density, the deepest
+# segmented-decay chains, and reads that always hit in-chunk writes.
+inp7 = make_inputs(B=1, H=2, L=64, N=64, W=8, R=8,
+                   write_pool=8, read_pool=8)
+inp7 = inp7[:-1] + (jnp.zeros_like(inp7[-1]),)  # also cover M0 = 0
+y_r7, M_r7 = recurrent_sdm(*inp7)
+for C in (8, 16, 64):
+    y_c7, M_c7 = chunkwise_sdm(*inp7, chunk_size=C)
+    e1 = report(f"collisions C={C}: y", y_c7, y_r7)
+    e2 = report(f"collisions C={C}: M_final", M_c7, M_r7)
+    assert e1 < 1e-3 and e2 < 1e-3, f"collision mismatch at C={C}"
+
+print("\n=== Test 8: strong decay stress — masked-pairwise is overflow-proof ===")
+# Hot slots + strong decay: per-slot within-chunk |Λ| far beyond fp32's
+# exp range for the factored e^{+λ}·e^{-λ} split (rule.py's ~88/~176
+# limits). The masked-before-exp pairwise form must stay finite and match
+# the recurrent oracle (the paper observes near-zero forget gates, App. B
+# — this regime is real).
+for scale, C in [(2.0, 16), (5.0, 32), (10.0, 64)]:
+    inp8 = make_inputs(B=1, H=1, L=64, N=32, W=8, R=8,
+                       decay_scale=scale, write_pool=8, read_pool=8)
+    y_r8, M_r8 = recurrent_sdm(*inp8)
+    y_c8, M_c8 = chunkwise_sdm(*inp8, chunk_size=C)
+    # deepest per-slot within-chunk log-decay of the last chunk (report only)
+    g_np, iw_np = np.asarray(inp8[5])[0, 0], np.asarray(inp8[0])[0, 0]
+    lam = np.zeros(32)
+    for t in range(64 - C, 64):
+        np.add.at(lam, iw_np[t], g_np[t])
+    deep = lam.min()
+    finite = bool(jnp.all(jnp.isfinite(y_c8)) and jnp.all(jnp.isfinite(M_c8)))
+    err = float(jnp.max(jnp.abs(y_c8 - y_r8)))
+    rel = err / (float(jnp.max(jnp.abs(y_r8))) + 1e-30)
+    print(f"decay_scale={scale:5.1f}, C={C:2d}: min per-slot Λ ≲ {deep:8.1f}  "
+          f"finite={finite}  max_err={err:.3e}  rel={rel:.3e}")
+    assert finite, f"chunkwise non-finite at scale={scale}"
+    assert rel < 1e-4, f"chunkwise inaccurate at scale={scale}: rel={rel}"
+
+print("\n=== Test 9: gradients — chunkwise vs recurrent ===")
+iw9, kw9, ir9, qr9, v9, g9, beta9, M09 = make_inputs(
+    B=1, H=2, L=32, N=32, W=6, R=6, write_pool=12, read_pool=12)
+
+
+def loss9(fn):
+    def f(floats):
+        kw_, qr_, v_, g_, beta_, M0_ = floats
+        y, Mf = fn(iw9, kw_, ir9, qr_, v_, g_, beta_, M0_)
+        return jnp.sum(y**2) + jnp.sum(Mf**2)
+    return f
+
+
+floats9 = (kw9, qr9, v9, g9, beta9, M09)
+g_ch = jax.grad(loss9(lambda *a: chunkwise_sdm(*a, chunk_size=8)))(floats9)
+g_re = jax.grad(loss9(recurrent_sdm))(floats9)
+for n, a_, b_ in zip(["dkw", "dqr", "dv", "dg", "dbeta", "dM0"], g_ch, g_re):
+    e = report(f"grad {n}", a_, b_)
+    assert bool(jnp.all(jnp.isfinite(a_))), f"non-finite chunkwise grad {n}"
+    assert e < 1e-3, f"chunkwise grad mismatch {n}"
 
 print("\nAll tests done.")

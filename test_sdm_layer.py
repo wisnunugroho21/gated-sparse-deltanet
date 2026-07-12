@@ -141,4 +141,54 @@ d = float(jnp.max(jnp.abs(y_cont - y[:, 48:])))
 print(f"warm-started second half vs full pass: max|dy| = {d:.3e}")
 assert d < 1e-5, "SDM continuation must be exact (no conv context to lose)"
 
+print("\n=== Test 11: core='chunkwise' (App. A) matches the recurrent core ===")
+# Same seed -> identical parameters; only the execution core differs.
+chunk_layer = SparseDeltaMemory(d_model=D, num_heads=H, sqrt_n=SN,
+                                num_writes=W, num_reads=R, head_v_dim=dv,
+                                core="chunkwise", chunk_size=32,
+                                rngs=nnx.Rngs(0))
+y_ch, M_ch = chunk_layer(x, return_state=True)   # L=96 = 3 chunks of 32
+d_y = float(jnp.max(jnp.abs(y_ch - y)))
+d_M = float(jnp.max(jnp.abs(M_ch - cache_full.memory)))
+print(f"chunkwise vs recurrent layer: max|dy| = {d_y:.3e}  max|dM| = {d_M:.3e}")
+assert d_y < 1e-4 and d_M < 1e-4
+
+print("\n=== Test 12: chunkwise __call__ validates L % chunk_size ===")
+try:
+    chunk_layer(x[:, :50])
+    raise AssertionError("expected ValueError for L=50, C=32")
+except ValueError as e:
+    print(f"__call__(L=50) raises: {e}")
+
+print("\n=== Test 13: chunkwise step — prefill split + decode ===")
+# 70 = 2 aligned chunks (64) through the chunkwise core + 6-token
+# recurrent tail; then 26 more (tail-only). Must equal the recurrent
+# full pass.
+cache = chunk_layer.init_cache(B)
+o1, cache = chunk_layer.step(x[:, :70], cache)
+o2, cache = chunk_layer.step(x[:, 70:], cache)
+d_y = float(jnp.max(jnp.abs(jnp.concatenate([o1, o2], 1) - y)))
+d_M = float(jnp.max(jnp.abs(cache.memory - cache_full.memory)))
+print(f"chunkwise step (70+26) vs recurrent full: max|dy| = {d_y:.3e}  "
+      f"max|dM| = {d_M:.3e}")
+assert d_y < 1e-4 and d_M < 1e-4
+# token-by-token decode on top of the chunkwise-prefilled cache
+cache2 = chunk_layer.init_cache(B)
+o_pre, cache2 = chunk_layer.step(x[:, :64], cache2)
+outs = [o_pre]
+for t in range(64, 72):
+    o, cache2 = chunk_layer.step(x[:, t:t + 1], cache2)
+    outs.append(o)
+d = float(jnp.max(jnp.abs(jnp.concatenate(outs, 1) - y[:, :72])))
+print(f"prefill(64) + decode(8×L=1) vs full: max|dy| = {d:.3e}")
+assert d < 1e-4
+# gradients reach every parameter through the chunkwise core too
+grads_ch = nnx.grad(loss)(chunk_layer, x[:, :64])
+flat_ch, _ = jax.tree_util.tree_flatten(grads_ch)
+bad = [g_ for g_ in flat_ch if not bool(jnp.all(jnp.isfinite(g_)))]
+zero = [g_ for g_ in flat_ch if float(jnp.max(jnp.abs(g_))) == 0.0]
+print(f"chunkwise grads: {len(flat_ch)} tensors — non-finite: {len(bad)}, "
+      f"all-zero: {len(zero)}")
+assert not bad and not zero
+
 print("\nAll tests done.")
