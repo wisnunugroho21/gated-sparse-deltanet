@@ -62,6 +62,32 @@ lower-triangular system (I + T) R = Z − Ē S0 (Eq. 39), solved by forward
 substitution; the output and end-of-chunk state are then dense matmuls.
 Only the cross-chunk state remains sequential.
 
+Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
+    G_r    = cumsum(g)            (inclusive, within chunk)        Eq. 18/30
+    gamma  = exp(G),  gamma_C = gamma[-1]  (total chunk decay)     Eq. 18/30
+    D_rsc  = exp(G_rc - G_sc)·1[s≤r]  (pairwise decay ratios)      from Eq. 19/32
+    Ebar   = gamma ⊙ (B ⊙ K)      (decay-absorbed erase factor)    Eq. 20/33
+    Z      = W ⊙ V                (gated write targets)            Eq. 20/33
+    Qgamma = gamma ⊙ Q            (decay-weighted queries)         Eq. 24/43
+    T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
+    A      = (I + T)^{-1}         (unit lower-triangular solve)    Eq. 21/34
+    Y, U   = A Ebar, A Z          (WY auxiliaries; share inverse)  Eq. 22/34
+    R      = U - Y S0             (the chunk's residual writes)    Eq. 35
+    Aqk_rs = Σ_c Q_rc K_sc D_rsc,  s ≤ r                           Eq. 25/43
+    O      = Qgamma S0 + Aqk R                                     Eq. 24/44
+    Ktail  = exp(G_C - G) ⊙ K     (tail-decayed keys)              Eq. 23/41
+    S_C    = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
+
+Every decay factor the algorithm consumes is a D_rsc ratio (or the
+tail/carry ratios exp(G_C − G_r), exp(G_C)), all with exponent ≤ 0. The
+four chunkwise cores differ ONLY in how the D_rsc inside T and A_qk are
+realized: faithful materializes the paper's split exp(G_r)·exp(−G_s)
+(matmuls; the exp(−G_s) half overflows); centered splits around c = G_C/2
+(matmuls, range doubled); pairwise forms each (r, s, channel) triple
+directly (einsums, unlimited range); subchunking factors off-diagonal
+sub-blocks through block boundaries and keeps only c×c diagonal blocks
+pairwise (matmul-dominated, unlimited range).
+
 The hand-derived backward of Appendix B is intentionally not implemented:
 jax.grad differentiates through solve_triangular and the elementwise gate
 products and reconstructs exactly those vector-Jacobian products. A manual
@@ -265,6 +291,9 @@ def _chunkwise_single_faithful(
     # Eq. 23/41:  (K_tail)_r = (γ_C/γ_r) ⊙ k_r.                   [N, C, dk]
     # The write at step r keeps decaying for the rest of the chunk, so it
     # enters the end-of-chunk state with the leftover factor γ_C/γ_r.
+    # Literal paper form: under strong decay both γ's underflow and this
+    # ratio becomes 0/0 = NaN — the other cores form it in log-space as
+    # exp(G_C − G_r) instead.
     Ktail = k * (gamma_C[:, None, :] / gamma)
 
     # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
@@ -330,8 +359,10 @@ def _chunkwise_single_centered(
       * it survives only where an absolute γ meets the state (Y S0, Q_γ S0),
         where it is re-attached by pre-scaling S0 with diag(exp(c)),
         exp(c) ≤ 1 — always safe.
-    Result is bit-for-bit the same recurrence with the safe per-chunk decay
-    range doubled to |G_C| ≈ 176; beyond that, reduce chunk_size.
+    The algebra is exactly the paper's — the shift cancels identically, only
+    the floating-point evaluation order changes — and the safe per-chunk
+    decay range doubles to |G_C| ≈ 176; beyond that, reduce chunk_size or
+    switch to the subchunking/pairwise cores.
 
     Args / returns: identical to _chunkwise_single_faithful.
     """
@@ -780,7 +811,9 @@ def chunkwise_gated_delta_rule_2(
 
     Uses the exponent-centered core (_chunkwise_single_centered); safe for
     per-chunk cumulative log-decay |G_C| up to ≈ 176 in fp32. For stronger
-    decay, reduce chunk_size or use the _chunkwise_single_pairwise core.
+    decay, reduce chunk_size, or switch cores: _chunkwise_single_subchunking
+    (unlimited range, matmul-dominated) or _chunkwise_single_pairwise
+    (unlimited range, simplest, ×C memory).
 
     Args:
       q, k, g, b: [B, H, L, dk]   v, w: [B, H, L, dv]   S0: [B, H, dk, dv]
