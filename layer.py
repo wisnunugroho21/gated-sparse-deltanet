@@ -86,7 +86,7 @@ class RMSNorm(nnx.Module):
         mean = jnp.mean(xf * xf, axis=-1, keepdims=True)
         rms = jax.lax.rsqrt(mean + self.eps)
 
-        return (xf * rms).astype(x.dtype) * self.weight.value
+        return (xf * rms).astype(x.dtype) * self.weight[...]
 
 
 class GatedRMSNorm(nnx.Module):
@@ -115,6 +115,8 @@ class GatedRMSNorm(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
+        # Deliberately NO compute_dtype here (unlike the q/k/v/b/w/o projections):
+        # the gate multiplies the fp32-normalized output, so it is kept in fp32.
         self.gate = nnx.Linear(
             d_model, inner_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )
@@ -199,6 +201,10 @@ class GatedDeltaNet2(nnx.Module):
         conv_size: int = 4,
         expanded_erase: bool = False,  # erase gate in [0,2] (neg-eigenvalue variant; Sec. 3.1, App. C.1)
         compute_dtype: jnp.dtype = jnp.float32,
+        core: str = "centered",  # rule.py chunkwise core; "subchunking"/"pairwise"
+        #   have no decay-range limit if the learned decay outgrows the centered
+        #   core's per-chunk |G_C| ~ 176 (see chunkwise_gated_delta_rule_2)
+        sub_chunk_size: int = 16,  # c for core="subchunking"; ignored otherwise
         *,
         rngs: nnx.Rngs,
     ):
@@ -219,6 +225,8 @@ class GatedDeltaNet2(nnx.Module):
         self.chunk_size = chunk_size
         self.conv_size = conv_size  # kernel width; sizes the streaming conv cache
         self.expanded_erase = expanded_erase
+        self.core = core
+        self.sub_chunk_size = sub_chunk_size
 
         # App. C.1 projection shapes: erase/key side -> H·d_k, write/value side -> H_v·d_v.
         k_proj_dim = self.H * self.dk  # q, k, b live on the key-head axis
@@ -383,8 +391,8 @@ class GatedDeltaNet2(nnx.Module):
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
         f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  Proj_f(x) in Eq. 86
-        d_t = self.dt_bias.value.astype(jnp.float32)  # [H*dk]  per-channel bias δ, Eq. 86
-        a_l = self.A_log.value.astype(jnp.float32)  # [H]  'a', per key head (App. C.1)
+        d_t = self.dt_bias[...].astype(jnp.float32)  # [H*dk]  per-channel bias δ, Eq. 86
+        a_l = self.A_log[...].astype(jnp.float32)  # [H]  'a', per key head (App. C.1)
 
         f = self._split_k(f_p + d_t, B, L)  # Proj_f(x)+δ -> [B,H,L,dk]
         a = jnp.exp(a_l)[None, :, None, None]  # exp(a), broadcast over the d_k channels
@@ -442,7 +450,10 @@ class GatedDeltaNet2(nnx.Module):
 
         # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
         o, _ = chunkwise_gated_delta_rule_2(
-            q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
+            q, k, v, g, b, w, initial_state,
+            chunk_size=self.chunk_size,
+            core=self.core,
+            sub_chunk_size=self.sub_chunk_size,
         )
 
         return self._output(o, x)
@@ -458,12 +469,19 @@ class GatedDeltaNet2(nnx.Module):
     #     decode : out, cache = layer.step(one_token, cache)   # repeat
     # ----------------------------------------------------------------------- #
     def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+        self, batch_size: int, max_len: int | None = None, dtype=None
     ) -> GDN2Cache:
-        """Empty streaming cache. `max_len` is accepted for a uniform interface with
-        the MLA cache but UNUSED here — the GDN-2 state is fixed-size, independent of
-        sequence length (the point of linear attention)."""
+        """Empty streaming cache. `max_len` is accepted for interface parity with
+        attention caches but UNUSED here — the GDN-2 state is fixed-size,
+        independent of sequence length (the point of linear attention).
+
+        The conv caches default to the layer's compute_dtype: they hold pre-conv
+        projection outputs, which are produced in that dtype, so a mismatched
+        cache (e.g. fp32 against bf16 activations) would silently promote the
+        whole conv path at every decode step. The recurrent state S stays fp32
+        regardless (App. D.3)."""
         kc = self.conv_size - 1
+        dtype = dtype or self.compute_dtype
         return GDN2Cache(
             recurrent_state=jnp.zeros(
                 (batch_size, self.Hv, self.dk, self.dv), jnp.float32
@@ -513,6 +531,8 @@ class GatedDeltaNet2(nnx.Module):
                 w[:, :, :n_full],
                 S,
                 chunk_size=self.chunk_size,
+                core=self.core,
+                sub_chunk_size=self.sub_chunk_size,
             )
             outs.append(o_head)
 
