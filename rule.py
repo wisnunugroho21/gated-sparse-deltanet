@@ -62,22 +62,25 @@ lower-triangular system (I + T) R = Z − Ē S0 (Eq. 39), solved by forward
 substitution; the output and end-of-chunk state are then dense matmuls.
 Only the cross-chunk state remains sequential.
 
-Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
-    G_r    = cumsum(g)            (inclusive, within chunk)        Eq. 18/30
-    gamma  = exp(G),  gamma_C = gamma[-1]  (total chunk decay)     Eq. 18/30
-    D_rsc  = exp(G_rc - G_sc)·1[s≤r]  (pairwise decay ratios)      from Eq. 19/32
-    Ebar   = gamma ⊙ (B ⊙ K)      (decay-absorbed erase factor)    Eq. 20/33
-    Z      = W ⊙ V                (gated write targets)            Eq. 20/33
-    Qgamma = gamma ⊙ Q            (decay-weighted queries)         Eq. 24/43
-    T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
-    A      = (I + T)^{-1}         (unit lower-triangular solve)    Eq. 21/34
-    Y, U   = A Ebar, A Z          (WY auxiliaries; share inverse)  Eq. 22/34
-    R      = U - Y S0             (the chunk's residual writes)    Eq. 35
-    Aqk_rs = Σ_c Q_rc K_sc D_rsc,  s ≤ r                           Eq. 25/43
-    O      = Qgamma S0 + Aqk R                                     Eq. 24/44
-    Ktail  = exp(G_C - G) ⊙ K     (tail-decayed keys)              Eq. 23/41
-    S_C    = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
+Chunkwise WY form (Eqs. 18-25 / 30-44):
+    G_r     = cumsum(g)             (inclusive, within chunk)       Eq. 18/30
+    gamma   = exp(G)                                                Eq. 18/30
+    gamma_C = gamma[-1]             (total chunk decay)             Eq. 18/30
+    Kbar    = exp(-G) ⊙ K           (the overflow source)           Eq. 19/33
+    Ebar    = gamma ⊙ (B ⊙ K)       (decay-absorbed erase factor)   Eq. 20/33
+    Z       = W ⊙ V                 (gated write targets)           Eq. 20/33
+    Qgamma  = gamma ⊙ Q             (decay-weighted queries)        Eq. 24/43
+    T       = tril(Ebar Kbar^T, -1)                                 Eq. 21/34
+    A       = (I + T)^{-1}          (unit lower-triangular solve)   Eq. 21/34
+    Y       = A Ebar                (WY auxiliaries)                Eq. 22/34
+    U       = A Z                   (WY auxiliaries)                Eq. 22/34
+    R       = U - Y S0              (the chunk's residual writes)   Eq. 35
+    Aqk     = tril(Qgamma Kbar^T)                                   Eq. 25/43
+    O       = Qgamma S0 + Aqk R                                     Eq. 24/44
+    Ktail   = exp(G_C - G) ⊙ K      (tail-decayed keys)             Eq. 23/41
+    S_C     = diag(gamma_C) S0 + Ktail^T R                          Eq. 23/40
 
+For the optimization strategy,
 Every decay factor the algorithm consumes is a D_rsc ratio (or the
 tail/carry ratios exp(G_C − G_r), exp(G_C)), all with exponent ≤ 0. The
 four chunkwise cores differ ONLY in how the D_rsc inside T and A_qk are
