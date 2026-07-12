@@ -232,6 +232,7 @@ def _recurrent_single(
     S_final, o = lax.scan(step, S0, (q, k, alpha, e, z))
     return o.squeeze(-1), S_final
 
+
 def _chunkwise_single_faithful(
     q: jax.Array,
     k: jax.Array,
@@ -257,6 +258,150 @@ def _chunkwise_single_faithful(
     Returns:
       (O: [L, dv], S_final: [dk, dv])
     """
+    L, dk = k.shape
+    dv = v.shape[-1]
+    C = chunk_size
+    N = L // C  # number of chunks
+
+    def to_chunks(x):
+        # [L, d] -> [N, C, d]: one leading axis per chunk, so every
+        # chunk-local quantity below is computed for all N chunks at once.
+        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
+
+    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
+    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
+
+    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
+    S0 = S0.astype(D_TYPE)          # [dk, dv]
+
+    # ---- Chunk-local precompute (parallel over the N chunks) -------------
+    # The cumsum restarts at each chunk boundary, which realizes both
+    # γ_0 = 1 (Eq. 18/30) and the normalized init Ŝ_0 = S_[n] (Eq. 31).
+
+    # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive, within chunk).   [N, C, dk]
+    # g ≤ 0 is the per-token log-decay, so γ_r = exp(G_r) = Π_{i≤r} α_i is
+    # the total shrinkage a key channel accumulated since chunk start. A
+    # write at step s read at step r survives with γ_r/γ_s = exp(G_r − G_s):
+    # summing logs turns the running product of gates into a cumsum.
+    G = jnp.cumsum(g, axis=1)
+
+    # Eq. 18/30:  γ_r = exp(G_r)                                  [N, C, dk]
+    gamma = jnp.exp(G)
+
+    # Total chunk decay γ_C (last row): how much of the chunk-entry state
+    # survives to the end of the chunk (the carry in Eq. 23/40).   [N, dk]
+    gamma_C = gamma[:, -1]
+
+    # --- Decay normalization: S_r = Diag(γ_r) Ŝ_r (Eq. 31) removes Diag(α)
+    # from the recurrence and moves it into the rank-one factors. The ratio
+    # γ_r/γ_s is split: γ^{-1} goes on the write side (K̄), γ on the read
+    # side (Ē).
+    # Eq. 19/32/33:  K̄ = γ^{-1} ⊙ K                              [N, C, dk]
+    Kbar = k * jnp.exp(-G)
+
+    # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K), with e_r = b_r ⊙ k_r (Eq. 8). [N, C, dk]
+    # Row r pairs with a K̄ row s<r as ē_rᵀ k̄_s = e_rᵀ Diag(γ_r/γ_s) k_s:
+    # how much of the association written at s, decayed until r, lies along
+    # the gated erase direction e_r.
+    Ebar = gamma * (b * k)
+
+    # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
+    # No γ here: values live on the dv axis, decay acts on key channels.
+    Z = w * v
+
+    # Eq. 24/43:  Q_γ, row r = γ_r ⊙ q_r.                         [N, C, dk]
+    # The query reads the chunk-entry state decayed down to its own step r.
+    Qg = gamma * q
+
+    # --- WY triangular solve (the parallelization) ---
+    # Eq. 21/34:  T = tril(Ē K̄ᵀ, −1), T_rs = ē_rᵀ k̄_s (s < r).   [N, C, C]
+    # T_rs measures how strongly token r's erase overlaps token s's decayed
+    # write. Strictly lower triangular = causality (r only erases the past).
+    T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
+
+    # Eq. 21/34:  A = (I + T)^{-1}.                                [N, C, C]
+    # Residuals obey ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): each
+    # edit first accounts for every earlier edit it partially erases.
+    # Stacked: (I + T) R = Z − Ē S0. I + T is unit lower-triangular, so one
+    # batched forward substitution replaces the C-step sequential recurrence.
+    A = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
+    )
+
+    # Eq. 22/34:  Y = A Ē — erase-side auxiliary.                 [N, C, dk]
+    Y = A @ Ebar
+
+    # Eq. 22/34:  U = A Z — write-side auxiliary.                 [N, C, dv]
+    # Y and U solve the SAME triangular system with different right-hand
+    # sides (row recurrences Eqs. 45/46), sharing the one inverse A. Both
+    # are independent of S0 — that is what lets all chunks precompute them
+    # in parallel before the sequential scan.
+    U = A @ Z
+
+    # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s.      [N, C, C]
+    # Decay-aware causal attention scores: query r attends to the write at
+    # s ≤ r with the key contracted channel-wise by the decay accumulated
+    # between s and r. tril INCLUDES the diagonal (a token reads its own
+    # write, ratio = 1).
+    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))
+
+    # Eq. 23/41:  (K_tail)_r = (γ_C/γ_r) ⊙ k_r.                   [N, C, dk]
+    # The write at step r keeps decaying for the rest of the chunk, so it
+    # enters the end-of-chunk state with the leftover factor γ_C/γ_r.
+    # Literal paper form: under strong decay both γ's underflow and this
+    # ratio becomes 0/0 = NaN — the other cores form it in log-space as
+    # exp(G_C − G_r) instead.
+    Ktail = k * (gamma_C[:, None, :] / gamma)
+
+    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
+    # S is the raw chunk-entry state S_[n] (NOT decay-normalized); each step
+    # is three small matmuls.
+    def chunk_step(
+        S: jax.Array,
+        inp: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
+        # S: [dk, dv].  Per-chunk slices:
+        # Y_n [C, dk], U_n [C, dv], Aqk_n [C, C], Qg_n [C, dk],
+        # Ktail_n [C, dk], gamma_C_n [dk].
+        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
+
+        # Eq. 35:  R = U − Y S0.                                    [C, dv]
+        # Row r is the residual ρ_r = z_r − ē_rᵀ Ŝ_{r−1} (Eq. 37): what is
+        # left to write at step r after subtracting what the decayed,
+        # already-edited memory returns along the erase direction. U covers
+        # the intra-chunk part; −Y S0 corrects for inherited content. R is
+        # exactly the chunk's set of rank-one updates:
+        # Ŝ_r = S0 + Σ_{s≤r} k̄_s ρ_sᵀ (Eq. 36).
+        R = U_n - Y_n @ S
+
+        # Eq. 24/44:  O = Q_γ S0 + A_qk R.                          [C, dv]
+        # Two read paths: history (query reads the chunk-entry state through
+        # its decay γ_r) + intra-chunk (causal scores against this chunk's
+        # residual writes). This is o_r = S_rᵀ q_r unrolled through Eq. 36.
+        o = Qg_n @ S + Aqk_n @ R
+
+        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
+        # Hand-off to the next chunk: old state after a full chunk of decay
+        # (erasures folded into R), plus every residual write re-keyed by
+        # its tail-decayed key. gamma_C broadcasts over key-channel rows.
+        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
+
+        return S_new, o
+
+    # scan carries S across chunks; stacked outputs o: [N, C, dv].
+    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
+    return o.reshape(L, dv), S_final
+
+def _chunkwise_single_stacked_RHS_solve(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    S0: jax.Array,
+    chunk_size: int,
+) -> tuple[jax.Array, jax.Array]:
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
