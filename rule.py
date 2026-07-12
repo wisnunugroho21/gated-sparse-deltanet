@@ -598,17 +598,21 @@ def _chunkwise_single_pairwise(
     # G_r − G_s ≥ 0, whose exp can overflow to inf, and a post-hoc tril
     # would then compute inf · 0 = NaN. Masked entries are sent to −inf so
     # exp gives exactly 0.
-    causal = jnp.tril(jnp.ones((C, C), dtype=bool))        # s ≤ r (Eq. 25/43)
-    strict = jnp.tril(jnp.ones((C, C), dtype=bool), k=-1)  # s < r (Eq. 21/34)
+    # Only ONE [N, C, C, dk] decay tensor is materialized — the inclusive
+    # (s ≤ r) one. T's strict (s < r) counterpart differs from it only on
+    # the diagonal, where D_incl = exp(0) = 1 (finite, no inf·0 hazard), so
+    # T is built with D_incl and the s = r scores are discarded afterwards
+    # by a strict tril on the small [N, C, C] result — saving a second
+    # full-tensor exp/where pass and its memory.
+    causal = jnp.tril(jnp.ones((C, C), dtype=bool))        # s ≤ r
     neg_inf = jnp.array(-jnp.inf, dtype=D_TYPE)
     D_incl = jnp.exp(jnp.where(causal[None, :, :, None], Gdiff, neg_inf))
-    D_strict = jnp.exp(jnp.where(strict[None, :, :, None], Gdiff, neg_inf))
 
     # Eq. 21/34:  T_rs = ē_rᵀ k̄_s = Σ_c e_rc k_sc exp(G_rc − G_sc), s < r.
     # Same entries as tril(Ē K̄ᵀ, −1), but the decay enters as a bounded
     # per-triple factor instead of two unbounded row/column scalings — an
     # einsum with a [C, C, dk] operand, not a matmul.            [N, C, C]
-    T = jnp.einsum('nrc,nsc,nrsc->nrs', b * k, k, D_strict)
+    T = jnp.tril(jnp.einsum('nrc,nsc,nrsc->nrs', b * k, k, D_incl), k=-1)
 
     # Eq. 25/43:  (A_qk)_rs = q_rᵀ Diag(γ_r/γ_s) k_s, s ≤ r — decay-aware
     # causal attention scores, same pairwise construction (diagonal
