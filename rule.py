@@ -81,12 +81,47 @@ Chunkwise WY form (Eqs. 18-25 / 30-44), shared by all four chunkwise cores:
 Every decay factor the algorithm consumes is a D_rsc ratio (or the
 tail/carry ratios exp(G_C − G_r), exp(G_C)), all with exponent ≤ 0. The
 four chunkwise cores differ ONLY in how the D_rsc inside T and A_qk are
-realized: faithful materializes the paper's split exp(G_r)·exp(−G_s)
-(matmuls; the exp(−G_s) half overflows); centered splits around c = G_C/2
-(matmuls, range doubled); pairwise forms each (r, s, channel) triple
-directly (einsums, unlimited range); subchunking factors off-diagonal
-sub-blocks through block boundaries and keeps only c×c diagonal blocks
-pairwise (matmul-dominated, unlimited range).
+realized:
+
+_chunkwise_single_faithful — the paper's literal split (matmuls; the
+exp(-G) half is unbounded, overflows fp32 once |G_C| > ~88):
+    Kbar   = exp(-G) ⊙ K          (the overflow source)            Eq. 19/33
+    D_rsc  = exp(G_rc)·exp(-G_sc)                                  Eq. 19/32
+    T      = tril(Ebar Kbar^T, -1)                                 Eq. 21/34
+    Aqk    = tril(Qgamma Kbar^T)                                   Eq. 25/43
+    Ktail  = (gamma_C / gamma) ⊙ K  (literal ratio: 0/0 = NaN
+                                     once both gammas underflow)   Eq. 23/41
+
+_chunkwise_single_centered — same split, exponents shifted by c = G_C/2
+per channel (matmuls; range doubles to |G_C| ~ 176):
+    Gc     = G - G_C/2            (spans ±|G_C|/2, not [G_C, 0])
+    delta  = exp(G_C/2) <= 1      (re-attaches the shift to S0)
+    Kbar   = exp(-Gc) ⊙ K,   Ebar_c = exp(Gc) ⊙ (B ⊙ K),
+    Qg_c   = exp(Gc) ⊙ Q
+    D_rsc  = exp(Gc_rc)·exp(-Gc_sc) = exp(G_rc - G_sc)  (c cancels)
+    T      = tril(Ebar_c Kbar^T, -1),   Aqk = tril(Qg_c Kbar^T)
+    R      = U - Y (delta ⊙ S0),  O = Qg_c (delta ⊙ S0) + Aqk R
+             (delta ⊙ S0 restores Y S0 and Qgamma S0 exactly)      Eq. 35, 24/44
+
+_chunkwise_single_pairwise — every triple formed directly (einsums over a
+[N, C, C, dk] tensor; no range limit, x C memory):
+    D_rsc  = exp(G_rc - G_sc)·1[s≤r]   (mask BEFORE exp: anti-causal
+             exponents are ≥ 0 and would give inf·0 = NaN after)
+    T_rs   = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                       Eq. 21/34
+    Aqk_rs = Σ_c Q_rc K_sc D_rsc,      s ≤ r                       Eq. 25/43
+    Ebar, Qgamma, Ktail as in the shared form (exponents ≤ 0, safe)
+
+_chunkwise_single_subchunking — M = C/c sub-blocks, decay factored through
+each row-block's entry boundary B_i = G at the last position before block
+i (matmul-dominated; no range limit, x C/c memory):
+    off-diagonal (r in block i, s in block j < i):
+        D_rsc = exp(G_rc - B_ic)·exp(B_ic - G_sc)   (s ≤ bnd ≤ r, so
+                BOTH exponents ≤ 0; batched matmuls per row-block)
+    diagonal (r, s in the same block):
+        Grel  = G - B_i ≤ 0        (block-local log-decay)
+        D_rsc = exp(Grel_rc - Grel_sc)·1[s≤r]   (pairwise form, but
+                only over c×c blocks; B_i cancels in the difference)
+    T, Aqk = off-diagonal blocks + scattered diagonal blocks       Eq. 21/34, 25/43
 
 The hand-derived backward of Appendix B is intentionally not implemented:
 jax.grad differentiates through solve_triangular and the elementwise gate
