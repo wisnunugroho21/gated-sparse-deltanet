@@ -14,8 +14,13 @@ Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
   out = Linear_o( RMSNorm(O) * SiLU(Linear_g(x)) )  # gated RMSNorm + out proj (Sec. 3.5, App. D.5)
 
 Grouped value heads (Sec. 3.5 last sentence / App. C.1): with num_v_heads = G*num_heads,
-the key-side tensors q, k, the log-decay g, and b are repeated across the G value-head
-groups; v and w already live on the value-head axis.
+the key-side tensors q, k, the log-decay g, and b are shared across the G value heads
+of each group; v and w live on the value-head axis. App. C.1 phrases the sharing as
+"repeated across the value-head group"; this implementation realizes the SAME math
+without the G× duplication: the recurrence is linear along the value axis, so each
+group folds into one recurrence of value width G·d_v, and the key-side cumsums,
+score matrices, and triangular solve are computed once per key head instead of once
+per value head. The public state layout stays per value head: [B, Hv, d_k, d_v].
 
 Scope: this is the recurrent TOKEN MIXER only (Fig. 1 right). The recurrent model
 (Sec. 3.5 "Model families") stacks [this + MLP]; the hybrid model inserts
@@ -165,7 +170,7 @@ class ShortConv(nnx.Module):
         """Shared conv core. `conv_state` is the previous (kernel_size-1) inputs used
         as left context, or None on the full/training path (pad with zeros == the
         causal left-pad). Returns (y: [B, L, C], new_state: [B, kernel_size-1, C])."""
-        B, L, C = x.shape
+        B, _, C = x.shape
         kc = self.kernel_size - 1
 
         left = jnp.zeros((B, kc, C), x.dtype) if conv_state is None else conv_state
@@ -343,8 +348,33 @@ class GatedDeltaNet2(nnx.Module):
         return x.reshape(B, L, self.H, self.dk).swapaxes(1, 2)  # [B,H,L,dk]
 
     def _split_v(self, x: jax.Array, B: int, L: int) -> jax.Array:
-        # Head reshaping for value-side tensors.
-        return x.reshape(B, L, self.Hv, self.dv).swapaxes(1, 2)  # [B,Hv,L,dv]
+        # Head reshaping for value-side tensors, GROUPED for GQA: the G value
+        # heads owned by one key head are contiguous in the flat projection,
+        # so folding them into one value axis of width G·d_v is a plain
+        # reshape. For G = 1 this is the ordinary [B, Hv, L, dv] head split.
+        return x.reshape(B, L, self.H, self.group * self.dv).swapaxes(1, 2)
+
+    # -- recurrent-state layout converters (GQA) ---------------------------- #
+    # Public layout: one [dk, dv] memory per VALUE head -> [B, Hv, dk, dv]
+    # (App. C.1 semantics; what GDN2Cache and initial_state use).
+    # Internal layout: the G group members concatenated along the value axis
+    # -> [B, H, dk, G·dv], what the folded recurrence consumes. Bijective
+    # reshapes; for G = 1 both layouts coincide.
+    def _state_in(self, S: jax.Array) -> jax.Array:
+        B = S.shape[0]
+        return (
+            S.reshape(B, self.H, self.group, self.dk, self.dv)
+            .swapaxes(2, 3)  # [B, H, dk, G, dv]
+            .reshape(B, self.H, self.dk, self.group * self.dv)
+        )
+
+    def _state_out(self, S: jax.Array) -> jax.Array:
+        B = S.shape[0]
+        return (
+            S.reshape(B, self.H, self.dk, self.group, self.dv)
+            .swapaxes(2, 3)  # [B, H, G, dk, dv]
+            .reshape(B, self.Hv, self.dk, self.dv)
+        )
 
     def _project(
         self, x: jax.Array, conv_states: tuple[jax.Array, jax.Array, jax.Array] | None
@@ -361,7 +391,8 @@ class GatedDeltaNet2(nnx.Module):
         Linear -> ShortConv -> SiLU -> head split -> L2 norm, plus the log-decay g
         and the channel-wise gates b, w.  `conv_states` is None on the full/training
         path, or a (q, k, v) tuple of conv caches when streaming.  Returns
-        (q, k, v, g, b, w) on the value-head (Hv) axis and the updated conv states
+        (q, k, v, g, b, w) on the KEY-head axis — v and w grouped to value
+        width G·d_v (see the GQA note below) — plus the updated conv states
         (or None)."""
         B, L, _ = x.shape
 
@@ -408,20 +439,25 @@ class GatedDeltaNet2(nnx.Module):
         w = jax.nn.sigmoid(self.w_proj(x))  # w = σ(Proj_w x) ∈ [0,1]^{d_v}
         w = self._split_v(w, B, L)
 
-        # GQA: repeat key-side tensors across value-head groups (Sec. 3.5 / App. C.1).
-        #   q, k, g, b are repeated; v, w already live on the value-head axis.
-        if self.group > 1:
-
-            def rep(t: jax.Array) -> jax.Array:
-                return jnp.repeat(t, self.group, axis=1)
-
-            q, k, g, b = rep(q), rep(k), rep(g), rep(b)
-
+        # GQA (Sec. 3.5 / App. C.1): q, k, g, b are shared by the G value heads
+        # of each group. App. C.1 phrases this as repeating the key-side tensors
+        # to Hv heads; here NO repeat happens — the recurrence is LINEAR along
+        # the value axis, so the G group members (which share every key-side
+        # factor) are folded into one recurrence of value width G·d_v: v and w
+        # arrived grouped from _split_v, and q, k, g, b stay on the H key-head
+        # axis. Algebraically identical to the repeat formulation (verified in
+        # test_layer.py), but the key-side cumsums, T/A_qk, and the triangular
+        # solve are computed once per key head instead of G times.
         return q, k, v, g, b, w, new_conv
 
     def _output(self, o: jax.Array, x: jax.Array) -> jax.Array:
-        """Gated RMSNorm + output projection (Sec. 3.5 / App. D.5). o: [B,Hv,L,dv]."""
-        o = o.swapaxes(1, 2)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
+        """Gated RMSNorm + output projection (Sec. 3.5 / App. D.5).
+
+        o arrives GROUPED from the core, [B, H, L, G·dv]; ungrouping to
+        [B, L, Hv, dv] restores the per-VALUE-head axis so the RMSNorm
+        normalizes each value head's dv channels separately."""
+        B, _, L, _ = o.shape
+        o = o.swapaxes(1, 2).reshape(B, L, self.Hv, self.dv)  # ungroup value heads
         o = self.o_norm(o, x).astype(
             x.dtype
         )  # SiLU output gate computed inside, from x (Sec. 3.5 / App. D.5)
@@ -429,34 +465,49 @@ class GatedDeltaNet2(nnx.Module):
         return self.o_proj(o)  # project back to d_model
 
     def __call__(
-        self, x: jax.Array, initial_state: jax.Array | None = None
-    ) -> jax.Array:
+        self,
+        x: jax.Array,
+        initial_state: jax.Array | None = None,
+        return_state: bool = False,
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
         """Full-sequence (training) forward via the CHUNKWISE parallel core.
-        x: [B, L, d_model] -> out: [B, L, d_model].
+        x: [B, L, d_model] -> out: [B, L, d_model], or (out, S_final) with
+        return_state=True.
 
         L must be divisible by chunk_size (the core validates and raises
         otherwise) — pad training batches to a multiple of C, or use `step`,
         which handles ragged lengths via its recurrent tail.
 
-        The core also produces the end-of-sequence recurrent state, but training only
-        needs the outputs, so it is discarded here (the streaming `step` below is what
-        threads the state across calls). `initial_state` lets a caller warm-start from a
-        prior state; it defaults to zeros."""
+        `initial_state` / the returned S_final use the public per-value-head
+        layout [B, Hv, dk, dv], so state can be carried across segment calls
+        (truncated-BPTT-style training: pass S_final of one segment — usually
+        via jax.lax.stop_gradient — as initial_state of the next). CAVEAT:
+        this carries the RECURRENT memory only; the short-conv left context is
+        not part of it, so the first conv_size-1 tokens of a continued segment
+        see zero-padding instead of the true previous tokens. For exact
+        continuation (inference) use `step`, whose cache carries both."""
         B, _, _ = x.shape
         q, k, v, g, b, w, _ = self._project(x, conv_states=None)
 
         if initial_state is None:
-            initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
+            S0 = jnp.zeros(
+                (B, self.H, self.dk, self.group * self.dv), jnp.float32
+            )
+        else:
+            S0 = self._state_in(initial_state)
 
         # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
-        o, _ = chunkwise_gated_delta_rule_2(
-            q, k, v, g, b, w, initial_state,
+        o, S_final = chunkwise_gated_delta_rule_2(
+            q, k, v, g, b, w, S0,
             chunk_size=self.chunk_size,
             core=self.core,
             sub_chunk_size=self.sub_chunk_size,
         )
 
-        return self._output(o, x)
+        out = self._output(o, x)
+        if return_state:
+            return out, self._state_out(S_final)
+        return out
 
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Same math, threading the fixed-size state in -> out.
@@ -516,7 +567,9 @@ class GatedDeltaNet2(nnx.Module):
 
         L = x.shape[1]
         n_full = (L // self.chunk_size) * self.chunk_size  # chunk-aligned prefix
-        S = cache.recurrent_state
+        # Cache holds the public per-value-head layout; the cores consume the
+        # grouped one (see _state_in/_state_out).
+        S = self._state_in(cache.recurrent_state)
         outs = []
 
         if n_full > 0:
@@ -551,4 +604,4 @@ class GatedDeltaNet2(nnx.Module):
             outs.append(o_tail)
 
         o = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=2)
-        return self._output(o, x), GDN2Cache(S, qcs, kcs, vcs)
+        return self._output(o, x), GDN2Cache(self._state_out(S), qcs, kcs, vcs)
