@@ -91,7 +91,9 @@ class RMSNorm(nnx.Module):
         mean = jnp.mean(xf * xf, axis=-1, keepdims=True)
         rms = jax.lax.rsqrt(mean + self.eps)
 
-        return (xf * rms).astype(x.dtype) * self.weight[...]
+        # Scale by the fp32 weight BEFORE the downcast — casting first would
+        # promote the result right back to fp32 and waste the cast.
+        return (xf * rms * self.weight[...]).astype(x.dtype)
 
 
 class GatedRMSNorm(nnx.Module):
@@ -154,6 +156,9 @@ class ShortConv(nnx.Module):
     def __init__(self, channels: int, kernel_size: int = 4, *, rngs: nnx.Rngs):
         self.channels = channels
         self.kernel_size = kernel_size
+        # Kernel/bias keep the nnx.Conv defaults (LeCun-normal / zeros):
+        # App. D.5's Xavier-gain rule covers "all linear layers", and the paper
+        # is silent on the short-conv init, so the lineage default stands.
         self.conv = nnx.Conv(
             in_features=channels,
             out_features=channels,
@@ -189,6 +194,16 @@ class ShortConv(nnx.Module):
     def step(
         self, x: jax.Array, conv_state: jax.Array
     ) -> tuple[jax.Array, jax.Array]:  # streaming path; carry the left context in/out
+        # Single-token decode fast path: the conv output at ONE position is
+        # just a dot of each channel's kernel with its (kernel_size)-token
+        # window — cheaper than dispatching a general convolution. Same math
+        # as _apply (verified by the decode test in test_layer.py).
+        if x.shape[1] == 1:
+            window = jnp.concatenate([conv_state, x], axis=1)  # [B, W, C]
+            kernel = self.conv.kernel[...][:, 0, :]  # depthwise [W, 1, C] -> [W, C]
+            y = jnp.einsum("bwc,wc->bc", window, kernel)[:, None, :]
+            y = y + self.conv.bias[...]
+            return y, window[:, 1:, :]
         return self._apply(x, conv_state)
 
 
@@ -415,9 +430,11 @@ class GatedDeltaNet2(nnx.Module):
         k = self._split_k(k, B, L)
         v = self._split_v(v, B, L)
 
-        # L2-normalize q, k per head (Sec. 3.5 "L2 normalization applied to q_t and k_t"; App. D.2).
-        q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
-        k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+        # L2-normalize q, k per head (Sec. 3.5 "L2 normalization applied to q_t
+        # and k_t"; App. D.2), as x·rsqrt(‖x‖² + ε) — one fused rsqrt instead
+        # of a sqrt and a divide; ε guards the all-zero rows SiLU can produce.
+        q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+        k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
 
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
