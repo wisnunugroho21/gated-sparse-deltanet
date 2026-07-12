@@ -12,27 +12,16 @@ jax.config.update("jax_enable_x64", False)
 from functools import partial
 
 from rule import (
-    _batchify,
-    _chunkwise_single_pairwise,
-    _chunkwise_single_subchunking,
     chunkwise_gated_delta_rule_2,
     recurrent_gated_delta_rule_2,
 )
 
-
-def pairwise_gated_delta_rule_2(*args, chunk_size=64):
-    """Batched wrapper around the pairwise log-space core (same I/O contract
-    as chunkwise_gated_delta_rule_2)."""
-    f = partial(_chunkwise_single_pairwise, chunk_size=chunk_size)
-    return _batchify(f)(*args)
-
-
-def subchunk_gated_delta_rule_2(*args, chunk_size=64, sub_chunk_size=16):
-    """Batched wrapper around the secondary-chunking core (same I/O contract
-    as chunkwise_gated_delta_rule_2)."""
-    f = partial(_chunkwise_single_subchunking,
-                chunk_size=chunk_size, sub_chunk_size=sub_chunk_size)
-    return _batchify(f)(*args)
+# Core-specific shorthands over the public core= selector. Bare
+# chunkwise_gated_delta_rule_2 calls exercise the default core ("centered").
+pairwise_gated_delta_rule_2 = partial(
+    chunkwise_gated_delta_rule_2, core="pairwise")
+subchunk_gated_delta_rule_2 = partial(
+    chunkwise_gated_delta_rule_2, core="subchunking")
 
 rng = np.random.default_rng(0)
 
