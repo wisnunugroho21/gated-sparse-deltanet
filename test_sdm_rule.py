@@ -12,7 +12,12 @@ jax.config.update("jax_enable_x64", False)
 from jax import lax
 
 from rule import recurrent_gated_delta_rule_2
-from sdm_rule import chunkwise_sdm, recurrent_sdm
+from sdm_rule import (
+    chunkwise_sdm,
+    chunkwise_sdm_2,
+    recurrent_sdm,
+    recurrent_sdm_2,
+)
 
 rng = np.random.default_rng(0)
 
@@ -268,5 +273,85 @@ for n, a_, b_ in zip(["dkw", "dqr", "dv", "dg", "dbeta", "dM0"], g_ch, g_re):
     e = report(f"grad {n}", a_, b_)
     assert bool(jnp.all(jnp.isfinite(a_))), f"non-finite chunkwise grad {n}"
     assert e < 1e-3, f"chunkwise grad mismatch {n}"
+
+print("\n=== Test 10: SDM-2 (decoupled b, w) — dense limit recovers GDR-2 ===")
+# Independent scalar erase b and per-channel write w. Dense limit must
+# equal rule.py's Gated Delta Rule-2 with scalar decay/erase broadcast
+# over key channels and w passed through UNCHANGED — the exact "-2"
+# decoupling, now on the slot axis.  (Reuses Test 2's dense tensors.)
+b_s = jnp.asarray(
+    (1.0 / (1.0 + np.exp(-rng.standard_normal((B, H, L))))).astype(np.float32))
+w_c = jnp.asarray(
+    (1.0 / (1.0 + np.exp(-rng.standard_normal((B, H, L, dv))))).astype(np.float32))
+y2d, M2d = recurrent_sdm_2(all_idx, kd, all_idx, qd, vd, gd, b_s, w_c, S0)
+O2d, S2d = recurrent_gated_delta_rule_2(
+    qd, kd, vd,
+    jnp.broadcast_to(gd[..., None], (B, H, L, N)),
+    jnp.broadcast_to(b_s[..., None], (B, H, L, N)),  # scalar erase -> per channel
+    w_c,                                             # per-channel write, as-is
+    S0)
+e1 = report("dense-limit SDM-2 vs GDR-2: y", y2d, O2d)
+e2 = report("dense-limit SDM-2 vs GDR-2: M_final", M2d, S2d)
+assert e1 < 1e-4 and e2 < 1e-4
+
+print("\n=== Test 11: SDM-2 sparse — naive oracle, chunkwise, gradients ===")
+def naive2_np(iw, kw, ir, qr, v, g, b, w, M0):
+    """Decoupled-gate float64 naive: Δ = w ⊙ v − b·ṽ."""
+    iw, ir = np.asarray(iw), np.asarray(ir)
+    kw, qr, v, g, b, w, M0 = (
+        np.asarray(x, dtype=np.float64) for x in (kw, qr, v, g, b, w, M0))
+    Bb, Hh, Ll, _ = kw.shape
+    Y = np.zeros((Bb, Hh, Ll, v.shape[-1]))
+    Mf = np.zeros_like(M0)
+    for bi in range(Bb):
+        for h in range(Hh):
+            M = M0[bi, h].copy()
+            for t in range(Ll):
+                Iw = iw[bi, h, t]
+                Msel = np.exp(g[bi, h, t]) * M[Iw]
+                v_ret = kw[bi, h, t] @ Msel
+                delta = w[bi, h, t] * v[bi, h, t] - b[bi, h, t] * v_ret
+                M[Iw] = Msel + np.outer(kw[bi, h, t], delta)
+                Y[bi, h, t] = qr[bi, h, t] @ M[ir[bi, h, t]]
+            Mf[bi, h] = M
+    return Y, Mf
+
+
+iw11, kw11, ir11, qr11, v11, g11, b11, M011 = make_inputs(
+    B=1, H=2, L=64, N=64, W=8, R=8, write_pool=16, read_pool=16)
+w11 = jnp.asarray(
+    (1.0 / (1.0 + np.exp(-rng.standard_normal((1, 2, 64, 16))))).astype(np.float32))
+inp11 = (iw11, kw11, ir11, qr11, v11, g11, b11, w11, M011)
+
+y_r11, M_r11 = recurrent_sdm_2(*inp11)
+y_n11, M_n11 = naive2_np(*inp11)
+e1 = report("recurrent SDM-2 vs float64 naive: y", y_r11,
+            jnp.asarray(y_n11, jnp.float32))
+e2 = report("recurrent SDM-2 vs float64 naive: M_final", M_r11,
+            jnp.asarray(M_n11, jnp.float32))
+assert e1 < 1e-4 and e2 < 1e-4
+
+for C in (8, 32, 64):
+    y_c11, M_c11 = chunkwise_sdm_2(*inp11, chunk_size=C)
+    e1 = report(f"SDM-2 chunkwise C={C}: y", y_c11, y_r11)
+    e2 = report(f"SDM-2 chunkwise C={C}: M_final", M_c11, M_r11)
+    assert e1 < 1e-3 and e2 < 1e-3, f"SDM-2 chunkwise mismatch at C={C}"
+
+
+def loss11(fn):
+    def f(floats):
+        kw_, qr_, v_, g_, b_, w_, M0_ = floats
+        y, Mf = fn(iw11, kw_, ir11, qr_, v_, g_, b_, w_, M0_)
+        return jnp.sum(y**2) + jnp.sum(Mf**2)
+    return f
+
+
+floats11 = (kw11, qr11, v11, g11, b11, w11, M011)
+g_ch = jax.grad(loss11(lambda *a: chunkwise_sdm_2(*a, chunk_size=16)))(floats11)
+g_re = jax.grad(loss11(recurrent_sdm_2))(floats11)
+for n, a_, b_ in zip(["dkw", "dqr", "dv", "dg", "db", "dw", "dM0"], g_ch, g_re):
+    e = report(f"grad {n}", a_, b_)
+    assert bool(jnp.all(jnp.isfinite(a_))), f"non-finite SDM-2 grad {n}"
+    assert e < 1e-3, f"SDM-2 grad mismatch {n}"
 
 print("\nAll tests done.")

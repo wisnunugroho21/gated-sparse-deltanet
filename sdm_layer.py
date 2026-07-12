@@ -3,15 +3,30 @@ against the paper (Cabannes et al., arXiv:2607.07386): Section 3.1 (the
 four-step layer), 3.2 (isoFLOP parameterization), 3.3 (head count vs state
 size), Section 4 "SDM Configuration", and Figure 2.
 
-Block design (Fig. 2; Sec. 3.1), paper-faithful variant:
+Block design (Fig. 2; Sec. 3.1):
   k' = Linear_k(x), q' = Linear_q(x)          # PKM scores, d -> 2√N per head
   I_w, k = softmax(top-W(k'₁ ⊕ k'₂))          # sparse write address (Sec. 3.1 step 1)
   I_r, q = softmax(top-R(q'₁ ⊕ q'₂))          # sparse read address
   v  = Linear_v(x)                            # value (Fig. 2: plain W_v, no conv/SiLU)
   g  = -exp(A) · softplus(Linear_a(x) + b_dt) # log-decay, scalar per head (Sec. 3.1 step 2)
-  β  = sigmoid(Linear_b(x))                   # input gate, scalar per head
-  y  = recurrent_sdm(...)                     # sparse gated delta rule (Eqs. 3-5)
+  b  = sigmoid(Linear_b(x))                   # erase gate, scalar per head
+  w  = sigmoid(Linear_w(x))  [variant="gdn2"] # write gate, per value channel
+     = b                     [variant="paper"]
+  y  = sdm core: M[i] += k⁽ⁱ⁾(w ⊙ v − b·ṽ)    # sparse gated delta rule (Eqs. 3-5)
   out = Linear_o( RMSNorm(y) * SiLU(Linear_g(x)) )  # norm+gate+head mix (Sec. 3.1 step 4)
+
+Variants (the delta-write gating):
+  * "paper" (default): the paper's rule, Eq. 4 — one input gate
+    β = σ(Linear_b x) ties erase and write: Δ = β(v − ṽ).
+  * "gdn2": GDN-2's decoupling (rule.py's "-2") transplanted onto the
+    sparse memory: Δ = w ⊙ v − b·ṽ with an independent per-value-channel
+    WRITE gate w = σ(Linear_w x) and the scalar ERASE gate b. GDN-2's b
+    is per KEY channel; key channels are the N slots here and a per-slot
+    gate would need a d -> N projection (the dense cost SDM removes), so
+    b stays scalar per head — the finest slot-side granularity available.
+    w lives on value channels, orthogonal to slots, and survives
+    sparsification untouched. NOT from the SDM paper — an experiment
+    this repo's GDN-2 lineage makes natural.
 
 Differences from the GDN-2 mixer (layer.py) — all from the paper:
   * NO short convolutions and NO L2 norm / SiLU on the q/k paths: the
@@ -65,7 +80,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from layer import GatedRMSNorm
-from sdm_rule import chunkwise_sdm, recurrent_sdm
+from sdm_rule import chunkwise_sdm_2, recurrent_sdm_2
 
 F32 = jnp.float32
 
@@ -99,6 +114,7 @@ class SparseDeltaMemory(nnx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         core: str = "recurrent",  # "recurrent" (oracle) or "chunkwise" (App. A)
         chunk_size: int = 64,  # C for core="chunkwise"; ignored otherwise
+        variant: str = "paper",  # "paper" (tied β, Eq. 4) or "gdn2" (w⊙v − b·ṽ)
         *,
         rngs: nnx.Rngs,
     ):
@@ -118,8 +134,10 @@ class SparseDeltaMemory(nnx.Module):
         assert 1 <= self.W <= self.N, "num_writes must be in [1, N]"
         assert 1 <= self.R <= self.N, "num_reads must be in [1, N]"
         assert core in ("recurrent", "chunkwise"), f"unknown core {core!r}"
+        assert variant in ("paper", "gdn2"), f"unknown variant {variant!r}"
         self.core = core
         self.chunk_size = chunk_size
+        self.variant = variant
 
         v_proj_dim = self.H * self.dv
 
@@ -161,7 +179,24 @@ class SparseDeltaMemory(nnx.Module):
             dtype=compute_dtype,
             param_dtype=F32,
             rngs=rngs,
-        )  # β_t = σ(W_b x_t), scalar per head (Sec. 3.1 step 2)
+        )  # scalar gate per head (Sec. 3.1 step 2): the input gate β
+        #    ("paper" — ties erase and write) or the erase gate b ("gdn2")
+
+        # Independent per-value-channel WRITE gate — "gdn2" variant only
+        # (rule.py's Proj_w transplanted; bias=True like the GDN-2 layer).
+        self.w_proj = (
+            nnx.Linear(
+                d_model,
+                v_proj_dim,
+                use_bias=True,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            )
+            if variant == "gdn2"
+            else None
+        )
         self.a_proj = nnx.Linear(
             d_model,
             self.H,
@@ -259,7 +294,8 @@ class SparseDeltaMemory(nnx.Module):
     def _project(self, x: jax.Array):
         """Front-end shared by __call__ and step: projections -> sparse
         addresses + values + gates, all on the [B, H, L, ...] layout the
-        core consumes. Returns (iw, kw, ir, qr, v, g, beta)."""
+        core consumes. Returns (iw, kw, ir, qr, v, g, b, w) — for
+        variant="paper" the write gate w is just b broadcast (tied β)."""
         B, L, _ = x.shape
 
         iw, kw = self._select(self.k_proj(x), self.W)  # write address
@@ -273,9 +309,17 @@ class SparseDeltaMemory(nnx.Module):
         g = -jnp.exp(self.A_log[...]) * jax.nn.softplus(f)
         g = g.swapaxes(1, 2)  # [B, H, L]
 
-        beta = jax.nn.sigmoid(self.b_proj(x).astype(F32)).swapaxes(1, 2)
+        b = jax.nn.sigmoid(self.b_proj(x).astype(F32)).swapaxes(1, 2)
 
-        return iw, kw, ir, qr, v, g, beta
+        if self.variant == "gdn2":
+            # Decoupled write gate w = σ(Proj_w x), per value channel.
+            w = jax.nn.sigmoid(self.w_proj(x).astype(F32))
+            w = w.reshape(B, L, self.H, self.dv).swapaxes(1, 2)
+        else:
+            # Tied gates (Eq. 4): w = β·1 — same scalar erases and writes.
+            w = jnp.broadcast_to(b[..., None], v.shape)
+
+        return iw, kw, ir, qr, v, g, b, w
 
     def _initial_memory(self, batch_size: int) -> jax.Array:
         """M₀ broadcast to the batch: the learned table (gradients flow
@@ -309,7 +353,7 @@ class SparseDeltaMemory(nnx.Module):
         carried across segment calls is EXACT here (no conv caveat, unlike
         the GDN-2 layer: an SDM layer's entire state is the table)."""
         B, _, _ = x.shape
-        iw, kw, ir, qr, v, g, beta = self._project(x)
+        iw, kw, ir, qr, v, g, b, w = self._project(x)
 
         M0 = (
             self._initial_memory(B)
@@ -317,10 +361,10 @@ class SparseDeltaMemory(nnx.Module):
             else initial_state.astype(F32)
         )
         if self.core == "chunkwise":
-            y, M_final = chunkwise_sdm(
-                iw, kw, ir, qr, v, g, beta, M0, chunk_size=self.chunk_size)
+            y, M_final = chunkwise_sdm_2(
+                iw, kw, ir, qr, v, g, b, w, M0, chunk_size=self.chunk_size)
         else:
-            y, M_final = recurrent_sdm(iw, kw, ir, qr, v, g, beta, M0)
+            y, M_final = recurrent_sdm_2(iw, kw, ir, qr, v, g, b, w, M0)
 
         out = self._output(y, x)
         if return_state:
@@ -351,7 +395,7 @@ class SparseDeltaMemory(nnx.Module):
         L=1 decode step — the recurrent core, both threading the same
         memory table (the GDN-2 layer's step pattern). With
         core="recurrent" everything takes the recurrent core."""
-        iw, kw, ir, qr, v, g, beta = self._project(x)
+        iw, kw, ir, qr, v, g, b, w = self._project(x)
         M = cache.memory.astype(F32)
 
         L = x.shape[1]
@@ -365,20 +409,22 @@ class SparseDeltaMemory(nnx.Module):
         if n_full > 0:
             # Chunkwise prefill of the aligned prefix, warm-started from —
             # and updating — the running memory table.
-            y_head, M = chunkwise_sdm(
+            y_head, M = chunkwise_sdm_2(
                 iw[:, :, :n_full], kw[:, :, :n_full],
                 ir[:, :, :n_full], qr[:, :, :n_full],
-                v[:, :, :n_full], g[:, :, :n_full], beta[:, :, :n_full],
+                v[:, :, :n_full], g[:, :, :n_full],
+                b[:, :, :n_full], w[:, :, :n_full],
                 M, chunk_size=self.chunk_size)
             outs.append(y_head)
 
         if n_full < L:
             # Ragged tail (or the whole input when L < C, e.g. decode):
             # recurrent core, token-by-token.
-            y_tail, M = recurrent_sdm(
+            y_tail, M = recurrent_sdm_2(
                 iw[:, :, n_full:], kw[:, :, n_full:],
                 ir[:, :, n_full:], qr[:, :, n_full:],
-                v[:, :, n_full:], g[:, :, n_full:], beta[:, :, n_full:],
+                v[:, :, n_full:], g[:, :, n_full:],
+                b[:, :, n_full:], w[:, :, n_full:],
                 M)
             outs.append(y_tail)
 

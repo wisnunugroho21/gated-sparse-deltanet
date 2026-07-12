@@ -2,33 +2,49 @@
 
 Implements the sparse gated delta rule of Cabannes et al., "Sparse Delta
 Memory: Scaling the State of Linear RNNs through Sparsity"
-(arXiv:2607.07386), Section 3.1, paper-faithful variant.
+(arXiv:2607.07386), Section 3.1, in a GENERALIZED, GDN-2-style decoupled
+form ("SDM-2") of which the paper's rule is the tied-gate special case.
 
 The state is an explicit memory table M ∈ R^{N×dv} with N slots (N is
 orders of magnitude larger than GDN's dk). Each token touches only the
 W slots selected for writing and the R slots selected for reading; every
 other slot is left EXACTLY unchanged — including no decay ("Unselected
-slots remain unchanged", Sec. 3.1). Per token t (Eqs. 3-5, Fig. 2):
+slots remain unchanged", Sec. 3.1). Per token t (Eqs. 3-5, Fig. 2, with
+the erase/write decoupling of rule.py's Gated Delta Rule-2):
 
-    M̃_t[i] = α_t · M_{t-1}[i]                    i ∈ I_w   (forget, Eq. 3)
-    ṽ_t    = Σ_{i∈I_w} k⁽ⁱ⁾ · M̃_t[i]                       (retrieve)
-    M_t[i] = M̃_t[i] + β_t · k⁽ⁱ⁾ · (v_t − ṽ_t)   i ∈ I_w   (delta write, Eq. 4)
-    y_t    = Σ_{i∈I_r} q⁽ⁱ⁾ · M_t[i]                        (read, Eq. 5)
+    M̃_t[i] = α_t · M_{t-1}[i]                        i ∈ I_w   (forget, Eq. 3)
+    ṽ_t    = Σ_{i∈I_w} k⁽ⁱ⁾ · M̃_t[i]                           (retrieve)
+    M_t[i] = M̃_t[i] + k⁽ⁱ⁾ · (w_t ⊙ v_t − b_t · ṽ_t) i ∈ I_w   (delta write)
+    y_t    = Σ_{i∈I_r} q⁽ⁱ⁾ · M_t[i]                            (read, Eq. 5)
 
-α_t ∈ (0,1) and β_t ∈ (0,1) are per-head SCALARS (unlike GDN-2's
-per-channel gates); k⁽ⁱ⁾, q⁽ⁱ⁾ are the softmax-normalized top-W / top-R
-PKM scores produced by the layer (sdm_layer.py). The read happens AFTER
-the write, matching o_t = S_tᵀ q_t in rule.py.
+Gates, all computed by the layer (sdm_layer.py):
+  α_t ∈ (0,1)      scalar per head — the forget gate;
+  b_t ∈ (0,1)      scalar per head — the ERASE gate (how much of the
+                   recalled ṽ_t is subtracted). A per-slot b, GDN-2's
+                   original key-side granularity, would need a d -> N
+                   projection — exactly the dense cost SDM removes — so
+                   scalar is the finest slot-side granularity available;
+  w_t ∈ (0,1)^dv   per VALUE channel — the WRITE gate (which channels of
+                   v_t are stored). Value channels are orthogonal to
+                   slots, so GDN-2's w survives sparsification untouched.
+
+The paper-faithful rule (Eq. 4: β_t(v_t − ṽ_t)) is the TIED case
+b = w = β — the public recurrent_sdm / chunkwise_sdm wrappers, mirroring
+how classic (Gated) DeltaNet ties rule.py's b and w to one scalar β. The
+decoupled entry points are recurrent_sdm_2 / chunkwise_sdm_2. k⁽ⁱ⁾, q⁽ⁱ⁾
+are the softmax-normalized top-W / top-R PKM scores. The read happens
+AFTER the write, matching o_t = S_tᵀ q_t in rule.py.
 
 NOTE on Eq. (4) as printed: the paper writes the delta as (v_t − M̃_t[i])
 per slot, but Fig. 2 (ṽ_t = M̃_tᵀ k_t, Δv_t = v_t − ṽ_t) and the WY math of
 Appendix A (write-write interaction matrix A, the B·retrieved correction)
 use the FULL retrieval ṽ_t. We implement the ṽ_t form — it is also the
 only one that satisfies the paper's own "Connection to GDN": with N = dk,
-W = R = N and dense key values, the update reduces exactly to Gated
-DeltaNet,  M ← Diag(α)M − β k kᵀ Diag(α) M + β k vᵀ,  which equals
-rule.py's Gated Delta Rule-2 with tied gates b = w = β and scalar decay
-(verified in test_sdm_rule.py).
+W = R = N and dense key values, the decoupled update reduces exactly to
+rule.py's Gated Delta Rule-2 with scalar decay, scalar-broadcast erase b
+and per-channel write w,  M ← Diag(α)M − b k kᵀ Diag(α) M + k (w ⊙ v)ᵀ
+(tied case: Gated DeltaNet). Both reductions are verified against
+rule.py in test_sdm_rule.py.
 
 Two implementations of the same recurrence:
 
@@ -68,10 +84,11 @@ def _recurrent_sdm_single(
     qr: jax.Array,
     v: jax.Array,
     g: jax.Array,
-    beta: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
     M0: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Token-by-token SDM forward for ONE (batch, head) pair.
+    """Token-by-token SDM-2 forward for ONE (batch, head) pair.
 
     Args:
       iw: [L, W] int   write slot indices (top-W, distinct per token)
@@ -80,23 +97,24 @@ def _recurrent_sdm_single(
       qr: [L, R]       sparse read query values q⁽ⁱ⁾
       v:  [L, dv]      value vectors
       g:  [L]          log-decay, g ≤ 0; α = exp(g) ∈ (0,1]  (scalar/head)
-      beta: [L]        input gate β ∈ (0,1)                  (scalar/head)
+      b:  [L]          erase gate b ∈ (0,1)                  (scalar/head)
+      w:  [L, dv]      write gate w ∈ (0,1)^dv          (per value channel)
       M0: [N, dv]      initial memory table
     Returns:
       (y: [L, dv], M_final: [N, dv])
     """
     kw = kw.astype(D_TYPE)
     qr = qr.astype(D_TYPE)
-    v = v.astype(D_TYPE)
-    beta = beta.astype(D_TYPE)
+    b = b.astype(D_TYPE)
     M0 = M0.astype(D_TYPE)
 
     alpha = jnp.exp(g.astype(D_TYPE))  # α = exp(g), g ≤ 0 so α ∈ (0,1]  [L]
+    z = w.astype(D_TYPE) * v.astype(D_TYPE)  # gated write target  [L, dv]
 
     def step(M, inp):
         # M: [N, dv]; iw_t: [W], kw_t: [W], ir_t: [R], qr_t: [R],
-        # a_t, b_t: scalar, v_t: [dv].
-        iw_t, kw_t, ir_t, qr_t, a_t, b_t, v_t = inp
+        # a_t, b_t: scalar, z_t: [dv].
+        iw_t, kw_t, ir_t, qr_t, a_t, b_t, z_t = inp
 
         # Eq. 3: gather the W selected rows and decay ONLY them (lazy /
         # write-triggered forgetting — untouched slots keep full strength).
@@ -107,10 +125,12 @@ def _recurrent_sdm_single(
         # for this token's write address.                          [dv]
         v_ret = kw_t @ M_sel
 
-        # Eq. 4: delta write — store only the residual between the target
-        # v_t and the recalled ṽ_t, spread over the W slots by k⁽ⁱ⁾ and
-        # scaled by the input gate β.
-        M_sel = M_sel + kw_t[:, None] * (b_t * (v_t - v_ret))[None, :]
+        # Decoupled delta write: store the residual between the gated
+        # target z = w ⊙ v (WRITE gate picks value channels) and the
+        # b-muted recall (ERASE gate picks how much of ṽ is subtracted),
+        # spread over the W slots by k⁽ⁱ⁾. Tied b = w = β recovers the
+        # paper's Eq. 4: β(v − ṽ).
+        M_sel = M_sel + kw_t[:, None] * (z_t - b_t * v_ret)[None, :]
 
         # Scatter back. The top-W product-key indices of one token are
         # DISTINCT by construction (distinct (i₁, i₂) pairs — see
@@ -122,7 +142,7 @@ def _recurrent_sdm_single(
 
         return M, y_t
 
-    M_final, y = lax.scan(step, M0, (iw, kw, ir, qr, alpha, beta, v))
+    M_final, y = lax.scan(step, M0, (iw, kw, ir, qr, alpha, b, z))
     return y, M_final
 
 
@@ -133,20 +153,22 @@ def _chunkwise_sdm_single(
     qr: jax.Array,
     v: jax.Array,
     g: jax.Array,
-    beta: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
     M0: jax.Array,
     *,
     chunk_size: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Chunkwise-parallel SDM forward for ONE (batch, head) pair (App. A).
+    """Chunkwise-parallel SDM-2 forward for ONE (batch, head) pair (App. A).
 
     THE DENSE↔SPARSE MAPPING. Scattered to a dense N-vector κ_r (write
-    keys) with write mask m_r, the SDM recurrence is exactly rule.py's
+    keys) with write mask m_r, the SDM-2 recurrence is exactly rule.py's
     Gated Delta Rule-2 with N key channels, PER-SLOT decay
-    log α_r[i] = g_r · m_r[i] (written slots decay, untouched slots don't)
-    and tied gates b = w = β. Rule.py's WY quantities therefore carry
-    over verbatim, with the per-channel cumsum G replaced by the SEGMENTED
-    per-slot cumulative log-decay
+    log α_r[i] = g_r · m_r[i] (written slots decay, untouched slots don't),
+    scalar-broadcast erase gate b_r and per-channel write gate w_r
+    (tied b = w = β gives the paper's rule). Rule.py's WY quantities
+    therefore carry over verbatim, with the per-channel cumsum G replaced
+    by the SEGMENTED per-slot cumulative log-decay
 
         λ_{t,n} = Σ_{s≤t} g_s · 1[slot(t,n) ∈ I_w(s)]   (inclusive)
 
@@ -154,7 +176,7 @@ def _chunkwise_sdm_single(
     the paper's "segmented prefix sum over slot indices". Every inner
     product over N collapses to a sum over MATCHING slot indices:
 
-      T[r,s]   = β_r Σ_{n,m: Iw_r[n]=Iw_s[m]} k_r⁽ⁿ⁾k_s⁽ᵐ⁾ e^{λ_{r,n}−λ_{s,m}}, s<r
+      T[r,s]   = b_r Σ_{n,m: Iw_r[n]=Iw_s[m]} k_r⁽ⁿ⁾k_s⁽ᵐ⁾ e^{λ_{r,n}−λ_{s,m}}, s<r
       Aqk[t,s] =     Σ_{n,m: Ir_t[n]=Iw_s[m]} q_t⁽ⁿ⁾k_s⁽ᵐ⁾ e^{λʳ_{t,n}−λ_{s,m}}, s≤t
 
     (the paper's A and QK, Eq. 7 / App. A.2 — Aqk's inclusive diagonal is
@@ -165,10 +187,11 @@ def _chunkwise_sdm_single(
     paper observes near-zero forget gates on some slots (App. B).
 
     Phase 1 (parallel over chunks; App. A.1): λ, T, Aqk, and ONE unit
-    lower-triangular solve with stacked RHS [diag(β)V | diag(β)] giving
-      ΔVconst = (I+T)⁻¹ diag(β) V   and   Bmat = (I+T)⁻¹ diag(β)
-    (the paper's ΔVconst and −B). Both are independent of the running
-    memory — that is what lets all chunks precompute in parallel.
+    lower-triangular solve with stacked RHS [W⊙V | diag(b)] giving
+      ΔVconst = (I+T)⁻¹ (W⊙V)   and   Bmat = (I+T)⁻¹ diag(b)
+    (the paper's ΔVconst and −B; tied gates make them diag(β)V and
+    diag(β)). Both are independent of the running memory — that is what
+    lets all chunks precompute in parallel.
 
     Phase 2 (sequential scan over chunks; App. A.1): per chunk, with the
     carried memory M (rule.py's S0 per chunk):
@@ -192,8 +215,8 @@ def _chunkwise_sdm_single(
     upgrade path if W grows.
 
     Args:
-      iw, kw: [L, W]   ir, qr: [L, R]   v: [L, dv]   g, beta: [L]
-      M0: [N, dv]      chunk_size: C (L must be divisible by C)
+      iw, kw: [L, W]   ir, qr: [L, R]   v: [L, dv]   g, b: [L]
+      w: [L, dv]       M0: [N, dv]      chunk_size: C (L divisible by C)
     Returns:
       (y: [L, dv], M_final: [N, dv])
     """
@@ -213,9 +236,9 @@ def _chunkwise_sdm_single(
     Iw, Ir = to_chunks(iw), to_chunks(ir)  # [n, C, W] / [n, C, R] (int)
     Kw = to_chunks(kw.astype(D_TYPE))  # [n, C, W]
     Qr = to_chunks(qr.astype(D_TYPE))  # [n, C, R]
-    V = to_chunks(v.astype(D_TYPE))  # [n, C, dv]
     G = to_chunks(g.astype(D_TYPE))  # [n, C]  log-decay, ≤ 0
-    Bt = to_chunks(beta.astype(D_TYPE))  # [n, C]
+    Bt = to_chunks(b.astype(D_TYPE))  # [n, C]  erase gate
+    Z = to_chunks(w.astype(D_TYPE) * v.astype(D_TYPE))  # w ⊙ v  [n, C, dv]
     M0 = M0.astype(D_TYPE)  # [N, dv]
 
     eye = jnp.eye(C, dtype=D_TYPE)
@@ -252,7 +275,7 @@ def _chunkwise_sdm_single(
     mskW = EQw & (strict[None, :, :, None, None] > 0)
     T = Bt[:, :, None] * jnp.einsum(
         "crsnm,crn,csm->crs", jnp.exp(jnp.where(mskW, dW, -jnp.inf)), Kw, Kw
-    )  # write-write "A", scaled by β_r -> Msys = I + T (App. A.1)
+    )  # write-write "A", scaled by the erase gate b_r -> Msys = I + T
 
     dR = lam_r[:, :, None, :, None] - lam_w[:, None, :, None, :]
     mskR = EQr & (incl[None, :, :, None, None] > 0)
@@ -261,14 +284,14 @@ def _chunkwise_sdm_single(
     )  # read-write "QK", inclusive diagonal (post-write read)
 
     # ONE stacked triangular solve (rule.py's solver discipline):
-    #   (I + T) [ΔVconst | Bmat] = [diag(β)V | diag(β)]
+    #   (I + T) [ΔVconst | Bmat] = [Z | diag(b)],   Z = W ⊙ V
     # ΔVconst is the intra-chunk delta-v assuming reads from the
     # chunk-initial memory; Bmat corrects it with the actual retrieved
     # rows in Phase 2 (δv = ΔVconst − Bmat·retrieved — the paper's
-    # B = −Msys⁻¹diag(β)).
+    # B = −Msys⁻¹diag(β), with the erase gate b in β's place).
     X = jax.scipy.linalg.solve_triangular(
         eye + T,
-        jnp.concatenate([Bt[..., None] * V, Bt[..., None] * eye[None]], axis=-1),
+        jnp.concatenate([Z, Bt[..., None] * eye[None]], axis=-1),
         lower=True,
         unit_diagonal=True,
     )
@@ -322,13 +345,77 @@ def _batchify(fn):
     """Lift the per-head core to batched [B, H, ...] inputs.
 
     Pure plumbing, no math (rule.py's pattern): vmap over heads (axis 1),
-    then over batch (axis 0). All 8 arguments map over their leading axis;
+    then over batch (axis 0). All 9 arguments map over their leading axis;
     M0 simply has no L axis.
     """
-    over_heads = jax.vmap(fn, in_axes=(0,) * 8, out_axes=(0, 0))
-    return jax.vmap(over_heads, in_axes=(0,) * 8, out_axes=(0, 0))
+    over_heads = jax.vmap(fn, in_axes=(0,) * 9, out_axes=(0, 0))
+    return jax.vmap(over_heads, in_axes=(0,) * 9, out_axes=(0, 0))
 
 
+def recurrent_sdm_2(
+    iw: jax.Array,
+    kw: jax.Array,
+    ir: jax.Array,
+    qr: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    M0: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Token-by-token SDM-2 forward (decoupled erase/write gates) —
+    the oracle / inference path.
+
+    Args:
+      iw: [B, H, L, W] int   kw: [B, H, L, W]   write indices / key values
+      ir: [B, H, L, R] int   qr: [B, H, L, R]   read indices / query values
+      v:  [B, H, L, dv]      g, b: [B, H, L]    values / log-decay / erase
+      w:  [B, H, L, dv]                         write gate (value channels)
+      M0: [B, H, N, dv]                         initial memory table
+    Returns:
+      (y: [B, H, L, dv], M_final: [B, H, N, dv])
+    """
+    return _batchify(_recurrent_sdm_single)(iw, kw, ir, qr, v, g, b, w, M0)
+
+
+def chunkwise_sdm_2(
+    iw: jax.Array,
+    kw: jax.Array,
+    ir: jax.Array,
+    qr: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    M0: jax.Array,
+    chunk_size: int = 64,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunkwise-parallel SDM-2 forward (decoupled gates) — training path.
+
+    Exact same recurrence as recurrent_sdm_2 with sequential depth L/C
+    instead of L (paper Appendix A; see _chunkwise_sdm_single for the
+    dense↔sparse mapping and the two-phase decomposition). Overflow-proof
+    for any decay strength (pairwise log-space exponents, all ≤ 0).
+
+    Args / returns: as recurrent_sdm_2, plus
+      chunk_size: intra-chunk length C (L must be divisible by C).
+    """
+    L = kw.shape[2]
+    if L % chunk_size:
+        raise ValueError(
+            f"sequence length L={L} must be divisible by chunk_size={chunk_size}")
+
+    def fun(iw_, kw_, ir_, qr_, v_, g_, b_, w_, M0_):
+        return _chunkwise_sdm_single(
+            iw_, kw_, ir_, qr_, v_, g_, b_, w_, M0_, chunk_size=chunk_size)
+
+    return _batchify(fun)(iw, kw, ir, qr, v, g, b, w, M0)
+
+
+# --------------------------------------------------------------------------- #
+#  Paper-faithful entry points: the TIED-gate case b = w = β (Eq. 4),
+#  exactly how classic (Gated) DeltaNet ties rule.py's b and w to one β.
+# --------------------------------------------------------------------------- #
 def recurrent_sdm(
     iw: jax.Array,
     kw: jax.Array,
@@ -339,17 +426,14 @@ def recurrent_sdm(
     beta: jax.Array,
     M0: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Token-by-token Sparse Delta Memory forward (oracle / inference path).
+    """Token-by-token SDM forward, paper-faithful rule (Eqs. 3-5):
+    recurrent_sdm_2 with tied gates b = β, w = β·1.
 
-    Args:
-      iw: [B, H, L, W] int   kw: [B, H, L, W]     write indices / key values
-      ir: [B, H, L, R] int   qr: [B, H, L, R]     read indices / query values
-      v:  [B, H, L, dv]      g, beta: [B, H, L]   values / log-decay / gate
-      M0: [B, H, N, dv]                           initial memory table
-    Returns:
-      (y: [B, H, L, dv], M_final: [B, H, N, dv])
+    Args / returns: as recurrent_sdm_2, with the single input gate
+    beta: [B, H, L] in place of (b, w).
     """
-    return _batchify(_recurrent_sdm_single)(iw, kw, ir, qr, v, g, beta, M0)
+    w = jnp.broadcast_to(beta[..., None], v.shape).astype(v.dtype)
+    return recurrent_sdm_2(iw, kw, ir, qr, v, g, beta, w, M0)
 
 
 def chunkwise_sdm(
@@ -363,29 +447,12 @@ def chunkwise_sdm(
     M0: jax.Array,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
-    """Chunkwise-parallel Sparse Delta Memory forward (training path).
+    """Chunkwise-parallel SDM forward, paper-faithful rule (Eqs. 3-5):
+    chunkwise_sdm_2 with tied gates b = β, w = β·1.
 
-    Exact same recurrence as recurrent_sdm with sequential depth L/C
-    instead of L (paper Appendix A; see _chunkwise_sdm_single for the
-    dense↔sparse mapping and the two-phase decomposition). Overflow-proof
-    for any decay strength (pairwise log-space exponents, all ≤ 0).
-
-    Args:
-      iw: [B, H, L, W] int   kw: [B, H, L, W]     write indices / key values
-      ir: [B, H, L, R] int   qr: [B, H, L, R]     read indices / query values
-      v:  [B, H, L, dv]      g, beta: [B, H, L]   values / log-decay / gate
-      M0: [B, H, N, dv]                           initial memory table
-      chunk_size: intra-chunk length C (L must be divisible by C).
-    Returns:
-      (y: [B, H, L, dv], M_final: [B, H, N, dv])
+    Args / returns: as chunkwise_sdm_2, with the single input gate
+    beta: [B, H, L] in place of (b, w).
     """
-    L = kw.shape[2]
-    if L % chunk_size:
-        raise ValueError(
-            f"sequence length L={L} must be divisible by chunk_size={chunk_size}")
-
-    def fun(iw_, kw_, ir_, qr_, v_, g_, beta_, M0_):
-        return _chunkwise_sdm_single(
-            iw_, kw_, ir_, qr_, v_, g_, beta_, M0_, chunk_size=chunk_size)
-
-    return _batchify(fun)(iw, kw, ir, qr, v, g, beta, M0)
+    w = jnp.broadcast_to(beta[..., None], v.shape).astype(v.dtype)
+    return chunkwise_sdm_2(iw, kw, ir, qr, v, g, beta, w, M0,
+                           chunk_size=chunk_size)

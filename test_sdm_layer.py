@@ -191,4 +191,44 @@ print(f"chunkwise grads: {len(flat_ch)} tensors — non-finite: {len(bad)}, "
       f"all-zero: {len(zero)}")
 assert not bad and not zero
 
+print("\n=== Test 14: variant='gdn2' — decoupled erase/write (w⊙v − b·ṽ) ===")
+# The paper variant must have NO write-gate projection; the gdn2 variant
+# adds Proj_w (d -> H·dv, with bias), mirroring the GDN-2 mixer.
+assert layer.w_proj is None, "paper variant must not create w_proj"
+gdn2 = SparseDeltaMemory(d_model=D, num_heads=H, sqrt_n=SN,
+                         num_writes=W, num_reads=R, head_v_dim=dv,
+                         variant="gdn2", rngs=nnx.Rngs(5))
+assert gdn2.w_proj is not None
+assert gdn2.w_proj.kernel[...].shape == (D, H * dv)
+y14 = gdn2(x)
+print(f"gdn2 __call__: {y14.shape}  finite={bool(jnp.all(jnp.isfinite(y14)))}")
+assert y14.shape == (B, L, D) and bool(jnp.all(jnp.isfinite(y14)))
+
+# streaming contract holds for the variant too (same core, extra gate)
+y14s, c14 = gdn2.step(x, gdn2.init_cache(B))
+d = float(jnp.max(jnp.abs(y14s - y14)))
+print(f"gdn2 step(full) vs __call__: max|dy| = {d:.3e}")
+assert d < 1e-5
+
+# chunkwise core agrees with the recurrent core for the variant
+gdn2_ch = SparseDeltaMemory(d_model=D, num_heads=H, sqrt_n=SN,
+                            num_writes=W, num_reads=R, head_v_dim=dv,
+                            variant="gdn2", core="chunkwise", chunk_size=32,
+                            rngs=nnx.Rngs(5))  # same seed -> same params
+y14c, M14c = gdn2_ch(x, return_state=True)
+d_y = float(jnp.max(jnp.abs(y14c - y14)))
+d_M = float(jnp.max(jnp.abs(M14c - c14.memory)))
+print(f"gdn2 chunkwise vs recurrent: max|dy| = {d_y:.3e}  max|dM| = {d_M:.3e}")
+assert d_y < 1e-4 and d_M < 1e-4
+
+# gradients reach every parameter, including the new Proj_w kernel+bias
+grads14 = nnx.grad(loss)(gdn2, x)
+flat14, _ = jax.tree_util.tree_flatten(grads14)
+bad = [g_ for g_ in flat14 if not bool(jnp.all(jnp.isfinite(g_)))]
+zero = [g_ for g_ in flat14 if float(jnp.max(jnp.abs(g_))) == 0.0]
+print(f"gdn2 grads: {len(flat14)} tensors — non-finite: {len(bad)}, "
+      f"all-zero: {len(zero)}  (paper variant has {len(flat)})")
+assert not bad and not zero
+assert len(flat14) == len(flat) + 2, "gdn2 must add exactly Proj_w kernel+bias"
+
 print("\nAll tests done.")
