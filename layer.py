@@ -198,7 +198,7 @@ class ShortConv(nnx.Module):
         # just a dot of each channel's kernel with its (kernel_size)-token
         # window — cheaper than dispatching a general convolution. Same math
         # as _apply (verified by the decode test in test_layer.py).
-        if x.shape[1] == 1:
+        if x.shape[1] == 1 and self.conv.bias is not None:
             window = jnp.concatenate([conv_state, x], axis=1)  # [B, W, C]
             kernel = self.conv.kernel[...][:, 0, :]  # depthwise [W, 1, C] -> [W, C]
             y = jnp.einsum("bwc,wc->bc", window, kernel)[:, None, :]
