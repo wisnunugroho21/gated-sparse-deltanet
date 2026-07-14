@@ -507,15 +507,34 @@ def _chunkwise_single_stacked_RHS_solve(
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
     # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z.
-    # Residuals obey ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): each
-    # edit first accounts for every earlier edit it partially erases.
-    # Stacked: (I + T) R = Z − Ē S0. I + T is unit lower-triangular, and Y
-    # and U solve the SAME system with different right-hand sides (row
-    # recurrences Eqs. 45/46), so ONE batched forward substitution over the
-    # stacked RHS [Ē | Z] yields both. The explicit inverse A = (I + T)^{-1}
-    # is never materialized: that would cost a C-RHS solve plus two matmuls
-    # and is numerically worse than solving directly.
-    # Both are independent of S0 — that is what lets all chunks precompute
+    #
+    # HOW Eq. 21/34 and Eq. 22/34 WORK. The chunk's residuals obey
+    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): before edit r can be
+    # applied, it must subtract its overlap T_rs with every EARLIER edit s it
+    # partially erases. Stacking the C rows turns that chain of corrections
+    # into one linear system, (I + T) R = Z − Ē S0 (Eq. 39). T is strictly
+    # lower triangular (causality), so I + T is unit lower-triangular and
+    # invertible by construction — Eq. 21/34 defines A = (I + T)^{-1}, and
+    # Eq. 22/34 pushes A onto the two S0-independent right-hand sides:
+    # Y = A Ē (erase side), U = A Z (write side), so that later
+    # R = U − Y S0 assembles the residuals for ANY chunk-entry state.
+    #
+    # HOW THE ROW RECURRENCES OF App. A.4 WORK. Expanding (I + T) Y = Ē and
+    # (I + T) U = Z row by row gives
+    #     y_rᵀ = ē_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) y_sᵀ,      Eq. 45
+    #     u_rᵀ = z_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) u_sᵀ,      Eq. 46
+    # i.e. row r starts from its own factor (ē_r or z_r) and subtracts each
+    # earlier, ALREADY-CORRECTED row s weighted by the overlap T_rs = ē_rᵀ k̄_s.
+    # Computing row 1, then row 2 from row 1, then row 3 from rows 1-2, ... is
+    # exactly forward substitution — solve_triangular below runs that C-step
+    # chain in one call. Both recurrences share the SAME coefficients T and
+    # differ only in the starting vectors, which is why one solve over the
+    # stacked RHS [Ē | Z] yields both auxiliaries at once (App. A.4: "the same
+    # WY inverse can be shared by the erase-side and write-side computations").
+    #
+    # The explicit inverse A is never materialized: that would cost a C-RHS
+    # solve plus two matmuls and is numerically worse than solving directly.
+    # Y and U are independent of S0 — that is what lets all chunks precompute
     # them in parallel before the sequential scan.
     YU = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.concatenate([Ebar, Z], axis=-1),
@@ -665,13 +684,36 @@ def _chunkwise_single_centered(
     # Overlap of edit r with the decayed write s; centering cancels here.
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē (erase side) and
-    # U = (I + T)^{-1} Z (write side) — the closed form of the causal chain
-    # of corrections ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).
-    # Same triangular system, two right-hand sides (Eqs. 45/46): one batched
-    # forward substitution over the stacked RHS [Ē | Z], no explicit inverse
-    # materialized. Both are S0-independent, hence precomputable for all
-    # chunks in parallel.
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z.
+    #
+    # HOW Eq. 21/34 and Eq. 22/34 WORK. The chunk's residuals obey
+    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): before edit r can be
+    # applied, it must subtract its overlap T_rs with every EARLIER edit s it
+    # partially erases. Stacking the C rows turns that chain of corrections
+    # into one linear system, (I + T) R = Z − Ē S0 (Eq. 39). T is strictly
+    # lower triangular (causality), so I + T is unit lower-triangular and
+    # invertible by construction — Eq. 21/34 defines A = (I + T)^{-1}, and
+    # Eq. 22/34 pushes A onto the two S0-independent right-hand sides:
+    # Y = A Ē (erase side), U = A Z (write side), so that later
+    # R = U − Y S0 assembles the residuals for ANY chunk-entry state.
+    #
+    # HOW THE ROW RECURRENCES OF App. A.4 WORK. Expanding (I + T) Y = Ē and
+    # (I + T) U = Z row by row gives
+    #     y_rᵀ = ē_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) y_sᵀ,      Eq. 45
+    #     u_rᵀ = z_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) u_sᵀ,      Eq. 46
+    # i.e. row r starts from its own factor (ē_r or z_r) and subtracts each
+    # earlier, ALREADY-CORRECTED row s weighted by the overlap T_rs = ē_rᵀ k̄_s.
+    # Computing row 1, then row 2 from row 1, then row 3 from rows 1-2, ... is
+    # exactly forward substitution — solve_triangular below runs that C-step
+    # chain in one call. Both recurrences share the SAME coefficients T and
+    # differ only in the starting vectors, which is why one solve over the
+    # stacked RHS [Ē | Z] yields both auxiliaries at once (App. A.4: "the same
+    # WY inverse can be shared by the erase-side and write-side computations").
+    #
+    # The explicit inverse A is never materialized: that would cost a C-RHS
+    # solve plus two matmuls and is numerically worse than solving directly.
+    # Y and U are independent of S0 — that is what lets all chunks precompute
+    # them in parallel before the sequential scan.
     YU = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.concatenate([Ebar, Z], axis=-1),
         lower=True, unit_diagonal=True,
@@ -827,13 +869,36 @@ def _chunkwise_single_pairwise(
     # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
     Z = w * v
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē (erase side) and
-    # U = (I + T)^{-1} Z (write side) — the closed form of the causal chain
-    # of corrections ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).
-    # Same triangular system, two right-hand sides (Eqs. 45/46): one batched
-    # forward substitution over the stacked RHS [Ē | Z], no explicit inverse
-    # materialized. Both are S0-independent, hence precomputable for all
-    # chunks in parallel.
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z.
+    #
+    # HOW Eq. 21/34 and Eq. 22/34 WORK. The chunk's residuals obey
+    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): before edit r can be
+    # applied, it must subtract its overlap T_rs with every EARLIER edit s it
+    # partially erases. Stacking the C rows turns that chain of corrections
+    # into one linear system, (I + T) R = Z − Ē S0 (Eq. 39). T is strictly
+    # lower triangular (causality), so I + T is unit lower-triangular and
+    # invertible by construction — Eq. 21/34 defines A = (I + T)^{-1}, and
+    # Eq. 22/34 pushes A onto the two S0-independent right-hand sides:
+    # Y = A Ē (erase side), U = A Z (write side), so that later
+    # R = U − Y S0 assembles the residuals for ANY chunk-entry state.
+    #
+    # HOW THE ROW RECURRENCES OF App. A.4 WORK. Expanding (I + T) Y = Ē and
+    # (I + T) U = Z row by row gives
+    #     y_rᵀ = ē_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) y_sᵀ,      Eq. 45
+    #     u_rᵀ = z_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) u_sᵀ,      Eq. 46
+    # i.e. row r starts from its own factor (ē_r or z_r) and subtracts each
+    # earlier, ALREADY-CORRECTED row s weighted by the overlap T_rs = ē_rᵀ k̄_s.
+    # Computing row 1, then row 2 from row 1, then row 3 from rows 1-2, ... is
+    # exactly forward substitution — solve_triangular below runs that C-step
+    # chain in one call. Both recurrences share the SAME coefficients T and
+    # differ only in the starting vectors, which is why one solve over the
+    # stacked RHS [Ē | Z] yields both auxiliaries at once (App. A.4: "the same
+    # WY inverse can be shared by the erase-side and write-side computations").
+    #
+    # The explicit inverse A is never materialized: that would cost a C-RHS
+    # solve plus two matmuls and is numerically worse than solving directly.
+    # Y and U are independent of S0 — that is what lets all chunks precompute
+    # them in parallel before the sequential scan.
     YU = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.concatenate([Ebar, Z], axis=-1),
         lower=True, unit_diagonal=True,
