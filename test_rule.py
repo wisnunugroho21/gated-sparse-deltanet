@@ -22,6 +22,10 @@ pairwise_gated_delta_rule_2 = partial(
     chunkwise_gated_delta_rule_2, core="pairwise")
 subchunk_gated_delta_rule_2 = partial(
     chunkwise_gated_delta_rule_2, core="subchunking")
+faithful_gated_delta_rule_2 = partial(
+    chunkwise_gated_delta_rule_2, core="faithful")
+stacked_rhs_gated_delta_rule_2 = partial(
+    chunkwise_gated_delta_rule_2, core="stacked_rhs")
 
 rng = np.random.default_rng(0)
 
@@ -268,5 +272,26 @@ O_pw, S_pw = pairwise_gated_delta_rule_2(*inp, chunk_size=32)
 e_o = report("subchunk(c=C) vs pairwise: O", O_sc, O_pw)
 e_s = report("subchunk(c=C) vs pairwise: S_final", S_sc, S_pw)
 assert e_o < 1e-6 and e_s < 1e-6, "c=C should reproduce the pairwise core"
+
+print("\n=== Test 19: faithful / stacked_rhs reference cores vs recurrent ===")
+# The paper-literal cores are only safe at mild decay (within-chunk
+# |G_C| < ~88); the default decay_scale=0.5 inputs stay well inside that.
+for name, fn in [("faithful", faithful_gated_delta_rule_2),
+                 ("stacked_rhs", stacked_rhs_gated_delta_rule_2)]:
+    for C in (8, 16, 32, 64, 128):
+        O_f, S_f = fn(*inp, chunk_size=C)
+        e_o = report(f"{name} C={C}: O", O_f, O_rec)
+        e_s = report(f"{name} C={C}: S_final", S_f, S_rec)
+        assert e_o < 1e-4 and e_s < 1e-4, f"{name} mismatch at C={C}"
+
+print("\n=== Test 20: faithful / stacked_rhs gradients (mild decay, C=16) ===")
+g_re = jax.grad(loss_fn(recurrent_gated_delta_rule_2))(inp)
+for name, fn in [("faithful", faithful_gated_delta_rule_2),
+                 ("stacked_rhs", stacked_rhs_gated_delta_rule_2)]:
+    g_f = jax.grad(loss_fn(lambda *a: fn(*a, chunk_size=16)))(inp)
+    for n, a_, b_ in zip(names, g_f, g_re):
+        err = report(f"{name} grad {n}", a_, b_)
+        assert bool(jnp.all(jnp.isfinite(a_))), f"non-finite {name} grad {n}"
+        assert err < 1e-3, f"{name} grad mismatch {n}: err={err}"
 
 print("\nAll tests done.")
