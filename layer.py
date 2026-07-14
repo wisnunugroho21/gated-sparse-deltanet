@@ -202,7 +202,10 @@ class ShortConv(nnx.Module):
             window = jnp.concatenate([conv_state, x], axis=1)  # [B, W, C]
             kernel = self.conv.kernel[...][:, 0, :]  # depthwise [W, 1, C] -> [W, C]
             y = jnp.einsum("bwc,wc->bc", window, kernel)[:, None, :]
-            y = y + self.conv.bias[...]
+
+            if self.conv.bias is not None:
+                y = y + self.conv.bias[...]
+
             return y, window[:, 1:, :]
         return self._apply(x, conv_state)
 
