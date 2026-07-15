@@ -16,6 +16,7 @@ from functools import partial
 
 from sparse_rule import (
     _pkm_select,
+    chunkwise_sparse_delta_memory,
     recurrent_sparse_delta_memory,
 )
 
@@ -175,5 +176,62 @@ for n, gr in zip(names, grads):
 # gradient w.r.t. the value path and gates is the meaningful signal for training.
 assert float(jnp.max(jnp.abs(grads[4]))) > 0, "value path has zero gradient"
 assert float(jnp.max(jnp.abs(grads[6]))) > 0, "beta gate has zero gradient"
+
+# ---------------------------------------------------------------- #
+# 6. Chunkwise training core vs the recurrent core, several C, W/R.
+# ---------------------------------------------------------------- #
+print("\n=== Test 6: chunkwise vs recurrent, several chunk sizes ===")
+inp = make_inputs(B=2, H=2, L=64, root=8, dv=24)
+y_rec, M_rec = recurrent_sparse_delta_memory(*inp, W=4, R=4)
+for C in (1, 2, 4, 8, 16, 32, 64):
+    y_ch, M_ch = chunkwise_sparse_delta_memory(*inp, chunk_size=C, W=4, R=4)
+    e_y = report(f"C={C}: y", y_ch, y_rec)
+    e_m = report(f"C={C}: M_final", M_ch, M_rec)
+    assert e_y < 1e-4 and e_m < 1e-4, f"chunkwise mismatch at C={C}"
+
+print("\n=== Test 7: chunkwise vs recurrent, various W/R (C=16) ===")
+for W, R in [(2, 6), (6, 2), (8, 8), (1, 1)]:
+    y_rec, M_rec = recurrent_sparse_delta_memory(*inp, W=W, R=R)
+    y_ch, M_ch = chunkwise_sparse_delta_memory(*inp, chunk_size=16, W=W, R=R)
+    e_y = report(f"W={W},R={R}: y", y_ch, y_rec)
+    e_m = report(f"W={W},R={R}: M_final", M_ch, M_rec)
+    assert e_y < 1e-4 and e_m < 1e-4, f"chunkwise mismatch at W={W},R={R}"
+
+# ---------------------------------------------------------------- #
+# 8. Chunkwise is overflow-safe under strong decay (all exponents ≤ 0).
+# ---------------------------------------------------------------- #
+print("\n=== Test 8: chunkwise overflow-safe under strong decay ===")
+for scale, C in [(3.0, 32), (8.0, 32), (20.0, 64)]:
+    inp_s = make_inputs(B=1, H=1, L=64, root=10, dv=16, decay_scale=scale)
+    y_ch, M_ch = chunkwise_sparse_delta_memory(*inp_s, chunk_size=C, W=6, R=6)
+    y_rec, M_rec = recurrent_sparse_delta_memory(*inp_s, W=6, R=6)
+    finite = bool(jnp.all(jnp.isfinite(y_ch)) and jnp.all(jnp.isfinite(M_ch)))
+    err = float(jnp.max(jnp.abs(y_ch - y_rec)))
+    rel = err / (float(jnp.max(jnp.abs(y_rec))) + 1e-30)
+    print(f"decay_scale={scale:5.1f}, C={C}: finite={finite}  rel={rel:.3e}")
+    assert finite, f"chunkwise non-finite at scale={scale}"
+    assert rel < 1e-4, f"chunkwise inaccurate at scale={scale}: rel={rel}"
+
+# ---------------------------------------------------------------- #
+# 9. Chunkwise gradients agree with the recurrent core.
+# ---------------------------------------------------------------- #
+print("\n=== Test 9: chunkwise gradients vs recurrent (C=16) ===")
+inp = make_inputs(B=1, H=2, L=32, root=8, dv=16)
+
+
+def loss_ch(args):
+    y, Mf = chunkwise_sparse_delta_memory(*args, chunk_size=16, W=4, R=4)
+    return jnp.sum(y**2) + jnp.sum(Mf**2)
+
+
+g_ch = jax.grad(loss_ch)(inp)
+g_re = jax.grad(loss_fn)(inp)
+for n, a_, b_ in zip(names, g_ch, g_re):
+    ok = bool(jnp.all(jnp.isfinite(a_)))
+    err = float(jnp.max(jnp.abs(a_ - b_)))
+    rel = err / (float(jnp.max(jnp.abs(b_))) + 1e-30)
+    print(f"grad {n:5s}: finite={ok}  max_err_vs_recurrent={err:.3e}  rel={rel:.3e}")
+    assert ok, f"non-finite chunkwise grad {n}"
+    assert rel < 1e-3, f"chunkwise grad mismatch {n}: rel={rel}"
 
 print("\nAll tests done.")

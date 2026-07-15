@@ -15,9 +15,43 @@ key vector k_t ∈ R^{dk} becomes a sparse weight vector supported on W slots.
 Per-token cost is O((W+R)·dv) — independent of N — so state capacity scales
 without adding FLOPs (paper Fig. 1, Sec. 3.2).
 
-THIS FILE — Phase 1: the token-by-token RECURRENT reference (the correctness
-oracle, analogous to rule.py's _recurrent_single) plus the PKM addressing it
-uses. The chunkwise-parallel training core (paper App. A) is a later phase.
+THIS FILE:
+  * the token-by-token RECURRENT reference (_recurrent_single_sdm, the
+    correctness oracle, analogous to rule.py's _recurrent_single);
+  * the CHUNKWISE-PARALLEL training core (_chunkwise_single_sdm), the WY
+    representation of paper App. A: an intra-chunk parallel phase (sparse
+    slot-overlap interaction matrices + one batched triangular solve) and a
+    sequential cross-chunk phase (sparse gather/scatter against the memory
+    table). Both share the PKM addressing below.
+
+CHUNKWISE DERIVATION (App. A, re-derived to match the recurrent core exactly).
+Within a chunk of C tokens, write dvp_i := β_i (v_i − r_i) for the per-token
+delta-value — the write scatters κ_i[n]·dvp_i to slot I^w_i[n]. Let the
+SEGMENTED cumulative log-decay of slot s as of token i be
+    Λ(s, i) = Σ_{j ≤ i, j writes s} log α_j
+(decay accrues only at the tokens that WRITE s — the lazy/segmented decay of
+the recurrent core). Then the intra-chunk delta read splits into a history read
+of the chunk-entry memory M_0 and a write–write interaction:
+    r_i = Σ_n κ_i[n] e^{Λ(s,i)} M_0[s]  +  Σ_{j<i} A[i,j] dvp_j,     s = I^w_i[n]
+    A[i,j] = Σ_{n,m: I^w_i[n]=I^w_j[m]} κ_i[n] κ_j[m] e^{Λ(s,i) − Λ(s,j)}   (Eq. 7)
+so dvp solves the unit-lower-triangular system (App. A "triangular solve")
+    M_sys dvp = diag(β)(V − History),   M_sys[i,j] = δ_ij + β_i A[i,j] (j<i),
+which the paper factors as dvp = ΔV_const + B·retrieved with
+ΔV_const = M_sys^{-1} diag(β) V and B = −M_sys^{-1} diag(β) (retrieved=History),
+so the V-part precomputes in parallel and only the M_0-dependent History stays
+in the sequential loop. The output reads the post-write memory:
+    y_i = Σ_n ρ_i[n] e^{Λ(s',i)} M_0[s']  +  Σ_{j≤i} QK[i,j] dvp_j,   s'=I^r_i[n]
+    QK[i,j] = Σ_{n,m: I^r_i[n]=I^w_j[m]} ρ_i[n] κ_j[m] e^{Λ(s,i) − Λ(s,j)}
+(the second term is tril(QK)·dvp; diagonal j=i is the read of the token's own
+write). Every decay factor is e^{Λ(s,i)−Λ(s,j)} with i≥j over a SHARED slot, so
+the exponent is ≤ 0 — the chunkwise core is overflow-safe with no centering.
+
+NUMERICS / COST. The sparse interaction is realized densely here: an
+[Nc, C, W, C, W] write–write equality/decay tensor (and [Nc, C, R, C, W] for
+read–write), i.e. O(L·C·W²) memory — the pure-JAX analogue of the paper's
+two-pointer-merge CUDA kernel (App. A.2). This is the reference-implementation
+cost, mirroring rule.py's pairwise core; a slot-bucketed kernel is what
+production would use. The [N, dv] memory table itself is the (large) state.
 
 FAITHFUL SDM (this phase). Built on the GDN base with a SINGLE input gate β
 (paper Eq. 4), i.e. NO GDN-2 decoupling: the key-side erase gate b and the
@@ -197,6 +231,170 @@ def _recurrent_single_sdm(
     return y, M_final
 
 
+def _chunkwise_single_sdm(
+    kw1: jax.Array,
+    kw2: jax.Array,
+    qr1: jax.Array,
+    qr2: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    M0: jax.Array,
+    chunk_size: int,
+    W: int,
+    R: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunkwise-parallel SDM forward for ONE (batch, head) pair (paper App. A).
+
+    Splits the L tokens into chunks of size C. An intra-chunk PARALLEL phase
+    (batched over all chunks) builds the sparse write–write / read–write
+    interaction matrices A, QK, the segmented decays, and the S0-independent
+    ΔV_const / B via one batched triangular solve; a sequential CROSS-CHUNK
+    phase gathers the entry memory, forms the delta-values, reads the output,
+    and scatters the writes back. Overflow-safe (all decay exponents ≤ 0);
+    verified against _recurrent_single_sdm.
+
+    Args:
+      kw1, kw2: [L, root]  write score halves (root = √N).
+      qr1, qr2: [L, root]  read  score halves.
+      v:        [L, dv]    values.
+      g:        [L]        per-head log-decay (≤ 0).
+      beta:     [L]        per-head input gate (∈ [0, 1]).
+      M0:       [N, dv]    initial memory (N = root²).
+      chunk_size: C; L must be divisible by C.
+      W, R:     number of write / read slots per token.
+    Returns:
+      (y: [L, dv], M_final: [N, dv])
+    """
+    L = kw1.shape[-2]
+    dv = v.shape[-1]
+    N = M0.shape[-2]
+    C = chunk_size
+    if C <= 0 or L % C:
+        raise ValueError(
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
+    Nc = L // C  # number of chunks
+
+    kw1, kw2, qr1, qr2 = (x.astype(D_TYPE) for x in (kw1, kw2, qr1, qr2))
+    v = v.astype(D_TYPE)
+    g = g.astype(D_TYPE)
+    beta = beta.astype(D_TYPE)
+    M0 = M0.astype(D_TYPE)
+
+    # ---- PKM selection (state-independent, parallel over all L tokens) -----
+    w_idx, w_sc = jax.vmap(partial(_pkm_select, topk=W))(kw1, kw2)  # [L, W]
+    r_idx, r_sc = jax.vmap(partial(_pkm_select, topk=R))(qr1, qr2)  # [L, R]
+    kappa = jax.nn.softmax(w_sc, axis=-1)  # [L, W]  write weights κ
+    rho = jax.nn.softmax(r_sc, axis=-1)    # [L, R]  read  weights ρ
+
+    # Fold everything into a leading chunk axis so the intra-chunk phase runs
+    # on all Nc chunks at once (a = the chunk axis in the einsums below).
+    def chk(x):
+        return x.reshape(Nc, C, *x.shape[1:])
+
+    w_idx, r_idx = chk(w_idx), chk(r_idx)          # [Nc, C, W] / [Nc, C, R]
+    kappa, rho = chk(kappa), chk(rho)              # [Nc, C, W] / [Nc, C, R]
+    v = chk(v)                                      # [Nc, C, dv]
+    g = g.reshape(Nc, C)                            # [Nc, C]
+    beta = beta.reshape(Nc, C)                      # [Nc, C]
+
+    eye = jnp.eye(C, dtype=D_TYPE)                  # [C, C]
+    leq = jnp.tril(jnp.ones((C, C), dtype=bool))    # [C, C]  j ≤ i
+    lt = jnp.tril(jnp.ones((C, C), dtype=bool), -1)  # [C, C] j < i
+    neg_inf = jnp.array(-jnp.inf, dtype=D_TYPE)
+
+    # ---- Slot-overlap structure --------------------------------------------
+    # eq_ww[a,i,n,j,m] = 1 iff token i's n-th write slot == token j's m-th
+    # write slot; eq_rw uses token i's READ slots against token j's write
+    # slots. These [Nc,C,W,C,W] / [Nc,C,R,C,W] tensors are the memory cost.
+    eq_ww = w_idx[:, :, :, None, None] == w_idx[:, None, None, :, :]
+    eq_rw = r_idx[:, :, :, None, None] == w_idx[:, None, None, :, :]
+
+    # writes_ind[a,i,n,j] = 1 iff slot I^w_i[n] is written by token j (any m).
+    # Distinct slots per token ⇒ the sum over m is a 0/1 indicator.
+    writes_ind = eq_ww.sum(-1).astype(D_TYPE)       # [Nc, C, W, C]
+    reads_ind = eq_rw.sum(-1).astype(D_TYPE)        # [Nc, C, R, C]
+
+    # Segmented cumulative log-decay Λ(s, i) at each write / read entry:
+    # sum of g_j over tokens j ≤ i that write the entry's slot (Λ ≤ 0).
+    Lw = jnp.einsum('ainj,aj,ij->ain', writes_ind, g, leq.astype(D_TYPE))  # [Nc,C,W]
+    Lr = jnp.einsum('ainj,aj,ij->ain', reads_ind, g, leq.astype(D_TYPE))   # [Nc,C,R]
+    # Λ_end(s) = total decay of slot s over the WHOLE chunk (all j), used to
+    # decay the entry memory and the tail of each write to the chunk end.
+    Lend = jnp.einsum('ainj,aj->ain', writes_ind, g)                       # [Nc,C,W]
+
+    # ---- Sparse interaction matrices A and QK (Eq. 7) ----------------------
+    # A[i,j] = Σ_{n,m: matching slot} κ_i[n] κ_j[m] e^{Λ(s,i)−Λ(s,j)}, j < i.
+    # Form the exponent as a DIFFERENCE, masked to matching+causal before the
+    # exp: on the kept entries i ≥ j over a shared slot, so Λ(s,i)−Λ(s,j) ≤ 0
+    # (exp ∈ (0,1], no overflow); elsewhere −inf ⇒ exp = 0.
+    Dww = jnp.exp(jnp.where(
+        eq_ww & lt[None, :, None, :, None],
+        Lw[:, :, :, None, None] - Lw[:, None, None, :, :], neg_inf))
+    A = jnp.einsum('ain,ajm,ainjm->aij', kappa, kappa, Dww)                # [Nc,C,C]
+
+    # QK[i,j] = Σ_{n,m: I^r_i[n]=I^w_j[m]} ρ_i[n] κ_j[m] e^{Λ(s,i)−Λ(s,j)},
+    # j ≤ i (diagonal included: the token reading its own write).
+    Dqk = jnp.exp(jnp.where(
+        eq_rw & leq[None, :, None, :, None],
+        Lr[:, :, :, None, None] - Lw[:, None, None, :, :], neg_inf))
+    QK = jnp.einsum('ain,ajm,ainjm->aij', rho, kappa, Dqk)                 # [Nc,C,C]
+
+    # ---- Triangular solve for the S0-independent factors -------------------
+    # M_sys[i,j] = δ_ij + β_i A[i,j] (j < i), unit lower-triangular. Solve for
+    # ΔV_const = M_sys^{-1} diag(β) V and B = −M_sys^{-1} diag(β): one batched
+    # solve over the stacked RHS [diag(β) V | diag(β)] gives both.
+    M_sys = eye + jnp.where(lt, beta[:, :, None] * A, 0.0)                 # [Nc,C,C]
+    diagb = beta[:, :, None] * eye                                          # [Nc,C,C]
+    rhs = jnp.concatenate([beta[:, :, None] * v, diagb], axis=-1)          # [Nc,C,dv+C]
+    X = jax.scipy.linalg.solve_triangular(
+        M_sys, rhs, lower=True, unit_diagonal=True)
+    dV_const = X[..., :dv]                                                  # [Nc,C,dv]
+    B = -X[..., dv:]                                                        # [Nc,C,C]
+
+    # Effective gather weights that fold the entry-memory decay into the
+    # addressing weights (paper's k_eff = κ·e^λ, q_eff = ρ·e^λ), and the
+    # write-to-end-of-chunk tail factor τ = e^{Λ_end − Λ(s,i)} ∈ (0,1].
+    kappa_eff = kappa * jnp.exp(Lw)                                         # [Nc,C,W]
+    rho_eff = rho * jnp.exp(Lr)                                             # [Nc,C,R]
+    tau = jnp.exp(Lend - Lw)                                                # [Nc,C,W]
+    decay_end = jnp.exp(Lend)                                               # [Nc,C,W] per-slot chunk decay
+
+    # ---- Sequential cross-chunk recurrence (the only sequential part) ------
+    def chunk_step(M, inp):
+        # M: [N, dv]  the entry memory for this chunk.
+        (wi, ri, ka, kaeff, rheff, dVc, Bc, QKc, tau_c, dend_c) = inp
+
+        Mw = M[wi]                                    # [C, W, dv] entry mem @ write slots
+        Mr = M[ri]                                    # [C, R, dv] entry mem @ read  slots
+
+        # History / inter reads of the chunk-entry memory (decay folded in).
+        retrieved = jnp.einsum('cw,cwv->cv', kaeff, Mw)   # [C, dv]
+        inter = jnp.einsum('cr,crv->cv', rheff, Mr)       # [C, dv]
+
+        # Delta-values: ΔV_const (from V) + B·retrieved (from entry memory).
+        dvp = dVc + Bc @ retrieved                        # [C, dv]
+
+        # Output: entry-memory read + intra-chunk causal read of this chunk's
+        # writes (tril already baked into QK by its j ≤ i mask).
+        y = inter + QKc @ dvp                             # [C, dv]
+
+        # Memory update: decay each touched slot by its total chunk decay,
+        # then scatter-add each write's tail-decayed contribution κ·τ·dvp.
+        decay_vec = jnp.ones((N,), D_TYPE).at[wi.reshape(-1)].set(
+            dend_c.reshape(-1))
+        contrib = (ka * tau_c)[:, :, None] * dvp[:, None, :]   # [C, W, dv]
+        M_new = decay_vec[:, None] * M
+        M_new = M_new.at[wi.reshape(-1)].add(contrib.reshape(-1, dv))
+        return M_new, y
+
+    M_final, y = lax.scan(
+        chunk_step, M0,
+        (w_idx, r_idx, kappa, kappa_eff, rho_eff, dV_const, B, QK, tau, decay_end))
+    return y.reshape(L, dv), M_final
+
+
 def _batchify_sdm(fn):
     """Lift a per-head SDM function to batched [B, H, ...] inputs.
 
@@ -238,4 +436,41 @@ def recurrent_sparse_delta_memory(
       (y: [B, H, L, dv], M_final: [B, H, N, dv])
     """
     fn = partial(_recurrent_single_sdm, W=W, R=R)
+    return _batchify_sdm(fn)(kw1, kw2, qr1, qr2, v, g, beta, M0)
+
+
+def chunkwise_sparse_delta_memory(
+    kw1: jax.Array,
+    kw2: jax.Array,
+    qr1: jax.Array,
+    qr2: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    M0: jax.Array,
+    chunk_size: int = 64,
+    W: int = 64,
+    R: int = 64,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunkwise-parallel Sparse Delta Memory forward (training path).
+
+    Faithful SDM (single input gate β; no GDN-2 decoupling), the WY
+    representation of paper App. A. Same I/O contract as
+    recurrent_sparse_delta_memory plus chunk_size (L must be divisible by C);
+    produces identical outputs to the recurrent core (verified in
+    test_sparse_rule.py) with only L/C sequential steps.
+
+    Args:
+      kw1, kw2: [B, H, L, root]  write score halves (root = √N).
+      qr1, qr2: [B, H, L, root]  read  score halves.
+      v:        [B, H, L, dv]    values.
+      g:        [B, H, L]        per-head log-decay (≤ 0).
+      beta:     [B, H, L]        per-head input gate (∈ [0, 1]).
+      M0:       [B, H, N, dv]    initial memory (N = root²).
+      chunk_size: intra-chunk length C.
+      W, R:     number of write / read slots per token.
+    Returns:
+      (y: [B, H, L, dv], M_final: [B, H, N, dv])
+    """
+    fn = partial(_chunkwise_single_sdm, chunk_size=chunk_size, W=W, R=R)
     return _batchify_sdm(fn)(kw1, kw2, qr1, qr2, v, g, beta, M0)
