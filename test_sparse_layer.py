@@ -123,4 +123,41 @@ assert a.shape == (H,) and dt_bias.shape == (H,)
 assert 1.0 <= np.exp(a).min() and np.exp(a).max() <= 16.0
 assert 0.9e-3 <= dt.min() and dt.max() <= 1.1e-1
 
+print("\n=== Test 10: GDN-2 decoupled variant — forward, streaming, gradients ===")
+dec = SparseDeltaMemory(
+    d_model=D, num_heads=H, head_v_dim=dv, n_slots_root=root, num_write=W,
+    num_read=R, chunk_size=Cs, decouple_erase_write=True, rngs=nnx.Rngs(4))
+assert hasattr(dec, "e_proj") and hasattr(dec, "w_proj")
+yd = dec(x)
+print(f"decoupled __call__: {yd.shape}  finite={bool(jnp.all(jnp.isfinite(yd)))}")
+assert yd.shape == (B, L, D) and bool(jnp.all(jnp.isfinite(yd)))
+
+# Streaming must still match the full pass exactly (erase/write gates are
+# threaded through both the chunkwise prefill and the recurrent tail).
+yd2, _ = dec.step(x, dec.init_cache(B))
+d_str = float(jnp.max(jnp.abs(yd2 - yd)))
+segs = [x[:, :32], x[:, 32:51], x[:, 51:]]
+cache = dec.init_cache(B)
+outs = []
+for s in segs:
+    o, cache = dec.step(s, cache)
+    outs.append(o)
+d_seg = float(jnp.max(jnp.abs(jnp.concatenate(outs, 1) - yd)))
+print(f"decoupled stream vs full: step={d_str:.3e}  segmented={d_seg:.3e}")
+assert d_str < 1e-5 and d_seg < 1e-4
+
+# The decoupled output differs from the faithful default (gates actually act).
+d_vs_faith = float(jnp.max(jnp.abs(yd - layer(x))))
+print(f"decoupled vs faithful default output differ by {d_vs_faith:.3e}")
+assert d_vs_faith > 1e-4
+
+# Gradients reach every parameter, including the new e_proj / w_proj.
+grads_d = nnx.grad(loss)(dec, x)
+flat_d, _ = jax.tree_util.tree_flatten(grads_d)
+bad_d = [gg for gg in flat_d if not bool(jnp.all(jnp.isfinite(gg)))]
+zero_d = [gg for gg in flat_d if float(jnp.max(jnp.abs(gg))) == 0.0]
+print(f"decoupled: {len(flat_d)} param tensors — non-finite: {len(bad_d)}, "
+      f"all-zero: {len(zero_d)}")
+assert not bad_d and not zero_d
+
 print("\nAll tests done.")

@@ -11,10 +11,19 @@ Block design (paper Fig. 2; Sec. 3.1):
   y  = sparse_delta_memory(k'_1,k'_2, q'_1,q'_2, v, g, b, M)   # Eqs. 3-5 + PKM
   out = W_o( RMSNorm(y) * SiLU(W_g x) )  # RMSNorm + SiLU gate + head-mix (step 4)
 
-FAITHFUL SDM (this layer). Built on the GDN base with a SINGLE input gate β —
-NO Gated DeltaNet-2 erase/write decoupling (the b, w gates of layer.py are
-dropped). The forget/input gates are PER-HEAD SCALARS (not per-channel as in
-GDN-2), matching the sparse recurrence in sparse_rule.py.
+FAITHFUL SDM (default). Built on the GDN base with a SINGLE input gate β; the
+forget/input gates are PER-HEAD SCALARS (not per-channel as in GDN-2), matching
+the sparse recurrence in sparse_rule.py.
+
+GATED SPARSE DELTANET-2 (decouple_erase_write=True). Re-adds the GDN-2
+erase/write decoupling on top of the sparse memory:
+  * value-side WRITE gate w = σ(W_w x) ∈ R^{dv} per head, gating z = w ⊙ v
+    (exactly GDN-2's write gate);
+  * key-side ERASE gate b — the sparse analogue of GDN-2's per-key-channel b —
+    as a per-SELECTED-SLOT gate from a Product-Key erase projection
+    W_e: d → 2√N, gathered at the write slots (κ_e = b ⊙ κ on the recall).
+β is retained as the overall input gate, so this is a strict superset of both
+faithful SDM (b≡1, w≡1) and the GDN-2 gating.
 
 DIFFERENCES vs the GDN-2 layer (layer.py), all from the paper:
   * NO short causal convolution — "the only difference [from GDN] is the lack
@@ -80,6 +89,7 @@ class SparseDeltaMemory(nnx.Module):
         num_read: int = 64,        # R read  slots per token (paper R=64)
         chunk_size: int = 64,      # C for the chunkwise training core
         learn_initial_state: bool = True,  # parametric memory M0 (paper default)
+        decouple_erase_write: bool = False,  # GDN-2 erase/write gates (Gated Sparse DeltaNet-2)
         compute_dtype: jnp.dtype = jnp.float32,
         core: str = "chunkwise",   # "chunkwise" (parallel) training path
         *,
@@ -94,6 +104,7 @@ class SparseDeltaMemory(nnx.Module):
         self.R = num_read
         self.chunk_size = chunk_size
         self.learn_initial_state = learn_initial_state
+        self.decouple_erase_write = decouple_erase_write
         self.compute_dtype = compute_dtype
         self.core = core
 
@@ -125,6 +136,19 @@ class SparseDeltaMemory(nnx.Module):
         self.b_proj = nnx.Linear(
             d_model, self.H, use_bias=True, kernel_init=_XAVIER,
             dtype=compute_dtype, param_dtype=F32, rngs=rngs)
+
+        # GDN-2 decoupling gates (only when decouple_erase_write): the value-side
+        # write gate w = σ(W_w x) ∈ R^{H·dv}, and the Product-Key ERASE score
+        # projection W_e: d → H·2·root (scores every slot; gathered per selected
+        # write slot inside the core to form b = σ(ew1[a] + ew2[c])).
+        if decouple_erase_write:
+            self.e_proj = nnx.Linear(
+                d_model, self.H * 2 * self.root, use_bias=False,
+                kernel_init=_XAVIER, dtype=compute_dtype, param_dtype=F32,
+                rngs=rngs)
+            self.w_proj = nnx.Linear(
+                d_model, self.H * self.dv, use_bias=True, kernel_init=_XAVIER,
+                dtype=compute_dtype, param_dtype=F32, rngs=rngs)
 
         # Decay parameters, GDN/FLA family init (paper: "matching GDN/FLA
         # conventions"), per head: exp(A_log) ∈ [1,16] and softplus(δ) ∈
@@ -162,8 +186,10 @@ class SparseDeltaMemory(nnx.Module):
 
     def _project(self, x: jax.Array):
         """Front-end shared by training and streaming: PKM score halves, value,
-        and the per-head log-decay g and input gate β. Returns
-        (kw1, kw2, qr1, qr2, v, g, beta), all on the [B, H, L, ...] head axis."""
+        the per-head log-decay g and input gate β, and (when decoupled) the
+        GDN-2 erase score halves ew1, ew2 and write gate w. Returns
+        (kw1, kw2, qr1, qr2, v, g, beta, ew1, ew2, w) on the [B,H,L,...] axis;
+        the last three are None unless decouple_erase_write."""
         B, L, _ = x.shape
 
         kw1, kw2 = self._split_scores(x, self.k_proj, B, L)  # write key halves
@@ -179,7 +205,14 @@ class SparseDeltaMemory(nnx.Module):
         # Per-head input gate β = σ(W_b x) ∈ [0,1] (Eq. 4).
         beta = jax.nn.sigmoid(self.b_proj(x)).astype(F32).swapaxes(1, 2)  # [B,H,L]
 
-        return kw1, kw2, qr1, qr2, v, g, beta
+        # GDN-2 decoupling gates (optional): erase score halves (the core turns
+        # them into a per-selected-slot b) and the value-side write gate w.
+        ew1 = ew2 = w = None
+        if self.decouple_erase_write:
+            ew1, ew2 = self._split_scores(x, self.e_proj, B, L)         # [B,H,L,root]
+            w = self.w_proj(x).reshape(B, L, self.H, self.dv).swapaxes(1, 2)  # [B,H,L,dv]
+
+        return kw1, kw2, qr1, qr2, v, g, beta, ew1, ew2, w
 
     def _init_memory(self, B: int) -> jax.Array:
         """Batched initial memory [B, H, N, dv]: the learned M0 broadcast over
@@ -211,11 +244,12 @@ class SparseDeltaMemory(nnx.Module):
         next for truncated-BPTT-style continuation. With no short conv, this
         carry is EXACT (unlike GDN2, there is no conv context to lose)."""
         B, _, _ = x.shape
-        kw1, kw2, qr1, qr2, v, g, beta = self._project(x)
+        kw1, kw2, qr1, qr2, v, g, beta, ew1, ew2, w = self._project(x)
         M0 = self._init_memory(B) if initial_state is None else initial_state
 
         y, M_final = chunkwise_sparse_delta_memory(
             kw1, kw2, qr1, qr2, v, g, beta, M0,
+            ew1=ew1, ew2=ew2, w=w,
             chunk_size=self.chunk_size, W=self.W, R=self.R)
 
         out = self._output(y, x)
@@ -236,17 +270,22 @@ class SparseDeltaMemory(nnx.Module):
         (including the L=1 decode step) through the token-by-token recurrent
         core. Both thread the same fixed-size memory, so the split is invisible
         in the output."""
-        kw1, kw2, qr1, qr2, v, g, beta = self._project(x)
+        kw1, kw2, qr1, qr2, v, g, beta, ew1, ew2, w = self._project(x)
         L = x.shape[1]
         n_full = (L // self.chunk_size) * self.chunk_size
         M = cache.recurrent_state
         outs = []
+
+        # Slice an optional gate tensor along the length axis, or pass None.
+        def sl(t, lo, hi):
+            return None if t is None else t[:, :, lo:hi]
 
         if n_full > 0:
             y_pre, M = chunkwise_sparse_delta_memory(
                 kw1[:, :, :n_full], kw2[:, :, :n_full],
                 qr1[:, :, :n_full], qr2[:, :, :n_full],
                 v[:, :, :n_full], g[:, :, :n_full], beta[:, :, :n_full], M,
+                ew1=sl(ew1, 0, n_full), ew2=sl(ew2, 0, n_full), w=sl(w, 0, n_full),
                 chunk_size=self.chunk_size, W=self.W, R=self.R)
             outs.append(y_pre)
 
@@ -255,6 +294,7 @@ class SparseDeltaMemory(nnx.Module):
                 kw1[:, :, n_full:], kw2[:, :, n_full:],
                 qr1[:, :, n_full:], qr2[:, :, n_full:],
                 v[:, :, n_full:], g[:, :, n_full:], beta[:, :, n_full:], M,
+                ew1=sl(ew1, n_full, L), ew2=sl(ew2, n_full, L), w=sl(w, n_full, L),
                 W=self.W, R=self.R)
             outs.append(y_tail)
 
