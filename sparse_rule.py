@@ -1,9 +1,14 @@
-"""Sparse Delta Memory (SDM) — recurrence + Product-Key addressing in JAX.
+"""Gated Sparse DeltaNet-2 — sparse-memory recurrence + Product-Key addressing.
 
 Implements the token-mixer memory of Cabannes et al., "Sparse Delta Memory:
 Scaling the State of Linear RNNs through Sparsity" (arXiv:2607.07386),
 Section 3.1 (Eqs. 3-5) with the Product-Key Memory addressing of Section 2 /
-Lample et al. (2019).
+Lample et al. (2019), extended with the Gated DeltaNet-2 erase/write decoupling
+(Hatamizadeh et al., arXiv:2605.22791; see rule.py). SDM as published is built
+on the GDN base with a single input gate β; HERE the GDN-2 decoupling is an
+INTRINSIC, always-on part of the core (not an optional add-on): every token
+carries a key-side erase gate b and a value-side write gate w. Feeding b ≡ 1,
+w ≡ 1 recovers the single-β SDM special case.
 
 WHAT SDM CHANGES vs Gated DeltaNet (see rule.py). GDN/GDN-2 keep a DENSE state
 S ∈ R^{dk×dv}: every token reads and writes all dk key-channel rows, so state
@@ -25,17 +30,20 @@ THIS FILE:
     table). Both share the PKM addressing below.
 
 CHUNKWISE DERIVATION (App. A, re-derived to match the recurrent core exactly).
-Within a chunk of C tokens, write dvp_i := β_i (v_i − r_i) for the per-token
-delta-value — the write scatters κ_i[n]·dvp_i to slot I^w_i[n]. Let the
-SEGMENTED cumulative log-decay of slot s as of token i be
+Within a chunk of C tokens, write dvp_i := β_i (z_i − r_i) for the per-token
+delta-value (z_i = w_i ⊙ v_i) — the write scatters κ_i[n]·dvp_i to slot
+I^w_i[n] (the WRITE weights κ, ungated by b). Let the SEGMENTED cumulative
+log-decay of slot s as of token i be
     Λ(s, i) = Σ_{j ≤ i, j writes s} log α_j
 (decay accrues only at the tokens that WRITE s — the lazy/segmented decay of
-the recurrent core). Then the intra-chunk delta read splits into a history read
-of the chunk-entry memory M_0 and a write–write interaction:
-    r_i = Σ_n κ_i[n] e^{Λ(s,i)} M_0[s]  +  Σ_{j<i} A[i,j] dvp_j,     s = I^w_i[n]
-    A[i,j] = Σ_{n,m: I^w_i[n]=I^w_j[m]} κ_i[n] κ_j[m] e^{Λ(s,i) − Λ(s,j)}   (Eq. 7)
+the recurrent core). With the erase-gated read weights κ_e := b ⊙ κ, the
+intra-chunk delta read splits into a history read of the chunk-entry memory M_0
+and a write–write interaction:
+    r_i = Σ_n κ_e_i[n] e^{Λ(s,i)} M_0[s]  +  Σ_{j<i} A[i,j] dvp_j,   s = I^w_i[n]
+    A[i,j] = Σ_{n,m: I^w_i[n]=I^w_j[m]} κ_e_i[n] κ_j[m] e^{Λ(s,i) − Λ(s,j)}  (Eq. 7)
+(the erase gate acts on the LEFT/read side; the write side keeps the plain κ)
 so dvp solves the unit-lower-triangular system (App. A "triangular solve")
-    M_sys dvp = diag(β)(V − History),   M_sys[i,j] = δ_ij + β_i A[i,j] (j<i),
+    M_sys dvp = diag(β)(Z − History),   M_sys[i,j] = δ_ij + β_i A[i,j] (j<i),
 which the paper factors as dvp = ΔV_const + B·retrieved with
 ΔV_const = M_sys^{-1} diag(β) V and B = −M_sys^{-1} diag(β) (retrieved=History),
 so the V-part precomputes in parallel and only the M_0-dependent History stays
@@ -53,12 +61,7 @@ two-pointer-merge CUDA kernel (App. A.2). This is the reference-implementation
 cost, mirroring rule.py's pairwise core; a slot-bucketed kernel is what
 production would use. The [N, dv] memory table itself is the (large) state.
 
-FAITHFUL SDM (this phase). Built on the GDN base with a SINGLE input gate β
-(paper Eq. 4), i.e. NO GDN-2 decoupling: the key-side erase gate b and the
-value-side write gate w of rule.py are both dropped here. Re-introducing the
-GDN-2 decoupling on top of the sparse memory is a deliberate later extension.
-
-Per SDM head, at token t (paper Sec. 3.1):
+Per head, at token t (paper Sec. 3.1 + the GDN-2 gates):
 
   1. SPARSE KEY SELECTION (PKM, Eq. of Sec. 2 / Fig. 2).
        write scores s^w = k'_1 ⊕ k'_2   (outer sum of the two √N score halves)
@@ -67,18 +70,23 @@ Per SDM head, at token t (paper Sec. 3.1):
        I^r_t = top-R(s^r),  ρ_t = softmax(s^r[I^r_t])      (R read  slots+weights)
      The outer-sum top-k never materializes all N scores: because
        top-k(s1 ⊕ s2) = top-k( top-k(s1) ⊕ top-k(s2) ),
-     it reduces a k×k candidate set instead (Sec. 2; see _pkm_select).
+     it reduces a k×k candidate set instead (Sec. 2; see _pkm_select). A
+     per-selected-slot ERASE gate b_t = σ(e'_1 ⊕ e'_2)[I^w_t] is gathered the
+     same way (see _erase_gate); κ_e := b ⊙ κ.
 
-  2. GATED DELTA WRITE (Eq. 3-4), only for the selected slots i ∈ I^w_t;
-     UNSELECTED slots are frozen — not even decayed (segmented/lazy decay):
+  2. GATED DELTA WRITE (Eq. 3-4 + GDN-2 decoupling), only for the selected
+     slots i ∈ I^w_t; UNSELECTED slots are frozen — not even decayed
+     (segmented/lazy decay):
        M̃_t[i] = α_t · M_{t-1}[i]                          (forget, Eq. 3)
-       r_t     = Σ_{i∈I^w_t} κ_t[i] · M̃_t[i]              (aggregate delta read)
-       M_t[i]  = M̃_t[i] + β_t · κ_t[i] · (v_t − r_t)       (delta write, Eq. 4)
-     α_t = exp(g_t) ∈ (0,1] is the PER-HEAD forget gate (g_t = log α_t ≤ 0,
-     a scalar per token, unlike GDN-2's per-channel decay); β_t ∈ [0,1] is the
-     per-head input gate; v_t ∈ R^{dv} is the value. The subtraction of the
-     aggregate read r_t is the delta rule — it recovers GDN exactly when N=dk
-     and all slots are selected (paper "Connection to GDN").
+       r_t     = Σ_{i∈I^w_t} (b_t·κ_t)[i] · M̃_t[i]        (erase-gated recall)
+       z_t     = w_t ⊙ v_t                                (value-side write gate)
+       M_t[i]  = M̃_t[i] + β_t · κ_t[i] · (z_t − r_t)       (delta write, Eq. 4)
+     α_t = exp(g_t) ∈ (0,1] is the PER-HEAD forget gate (g_t = log α_t ≤ 0, a
+     scalar per token); β_t ∈ [0,1] the per-head input gate; b_t (key/erase
+     side) and w_t (value/write side) are the GDN-2 decoupling gates. The recall
+     reads along the ERASE direction κ_e = b⊙κ while the write scatters with κ —
+     decoupling which slots are erased from which are written. b ≡ w ≡ 1 gives
+     the single-β SDM delta rule (recovers GDN when N=dk and all slots selected).
 
   3. SPARSE READ (Eq. 5), from the POST-write memory:
        y_t = Σ_{i∈I^r_t} ρ_t[i] · M_t[i]
@@ -90,9 +98,10 @@ Selection (step 1) depends only on the inputs, not on the memory state, so it
 is computed in PARALLEL for all L tokens before the sequential scan; only the
 write/read recurrence (steps 2-3) is sequential.
 
-Shape conventions (one head): the PKM score halves k'_1,k'_2,q'_1,q'_2 are
-[L, root] with root = √N; v: [L, dv]; g, beta: [L]; M0: [N, dv]. Public entry
-points add leading [B, H] axes via vmap. All math runs in fp32.
+Shape conventions (one head): the PKM score halves k'_1,k'_2,q'_1,q'_2 and the
+erase score halves e'_1,e'_2 are [L, root] with root = √N; v and the write gate
+w: [L, dv]; g, beta: [L]; M0: [N, dv]. Public entry points add leading [B, H]
+axes via vmap. All math runs in fp32.
 """
 
 from functools import partial
@@ -150,7 +159,7 @@ def _pkm_select(
 def _erase_gate(
     w_idx: jax.Array, ew1: jax.Array, ew2: jax.Array, root: int
 ) -> jax.Array:
-    """Per-selected-write-slot erase gate b (GDN-2 decoupling, optional).
+    """Per-selected-write-slot erase gate b (the GDN-2 key-side decoupling).
 
     The sparse analogue of GDN-2's per-key-channel erase gate b = σ(Proj_b x)
     (rule.py): a Product-Key erase projection ew = [ew1|ew2] scores every slot
@@ -158,7 +167,7 @@ def _erase_gate(
     W already-selected write slots and applies a sigmoid. b re-weights the
     RECALL / erase read direction (κ_e = b ⊙ κ) while the WRITE still scatters
     with κ — decoupling "which slots get erased" from "which get written". With
-    ew ≡ +∞ (b ≡ 1) the recurrence reduces to faithful SDM.
+    ew ≡ +∞ (b ≡ 1) the recurrence collapses to the single-β SDM special case.
 
     Args:
       w_idx: [L, W] flat write-slot indices (from _pkm_select).
@@ -182,20 +191,20 @@ def _recurrent_single_sdm(
     v: jax.Array,
     g: jax.Array,
     beta: jax.Array,
+    ew1: jax.Array,
+    ew2: jax.Array,
+    w: jax.Array,
     M0: jax.Array,
-    ew1: jax.Array | None = None,
-    ew2: jax.Array | None = None,
-    w: jax.Array | None = None,
     *,
     W: int,
     R: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Token-by-token SDM reference forward for ONE (batch, head) pair.
+    """Token-by-token Gated Sparse DeltaNet-2 forward for ONE (batch, head) pair.
 
     Direct scan of the sparse gated delta rule (paper Eqs. 3-5) with PKM
-    addressing (Sec. 2). O(L·(W+R)·dv) plus the O(L·(root + W² + R²))
-    selection — a trustworthy oracle for verifying the chunkwise path, and the
-    form used at inference (one token at a time).
+    addressing (Sec. 2) and the GDN-2 erase/write decoupling built in. O(L·(W+R)·dv)
+    plus the O(L·(root + W² + R²)) selection — a trustworthy oracle for verifying
+    the chunkwise path, and the form used at inference (one token at a time).
 
     Args:
       kw1, kw2: [L, root]  write score halves (root = √N); s^w = kw1 ⊕ kw2.
@@ -203,12 +212,10 @@ def _recurrent_single_sdm(
       v:        [L, dv]    value vectors (W_v x).
       g:        [L]        per-head log-decay, g = log α ≤ 0.
       beta:     [L]        per-head input gate β ∈ [0, 1].
+      ew1, ew2: [L, root]  GDN-2 erase score halves; a per-selected-write-slot
+                erase gate b = σ(ew1[a]+ew2[c]) re-weights the recall (κ_e = b⊙κ).
+      w:        [L, dv]    GDN-2 value-side write gate; z = w ⊙ v.
       M0:       [N, dv]    initial memory (N = root²); learnable or zeros.
-      ew1, ew2: [L, root]  OPTIONAL GDN-2 erase score halves; when given, a
-                per-selected-write-slot erase gate b re-weights the recall
-                (κ_e = b ⊙ κ). None ⇒ faithful SDM (b ≡ 1).
-      w:        [L, dv]    OPTIONAL GDN-2 value-side write gate; z = w ⊙ v.
-                None ⇒ z = v (faithful SDM).
       W, R:     ints       number of write / read slots selected per token.
     Returns:
       (y: [L, dv], M_final: [N, dv])
@@ -234,10 +241,10 @@ def _recurrent_single_sdm(
     kappa = jax.nn.softmax(w_sc, axis=-1)  # [L, W]  write weights κ
     rho = jax.nn.softmax(r_sc, axis=-1)    # [L, R]  read  weights ρ
 
-    # GDN-2 decoupling (optional): erase-gated read weights κ_e = b ⊙ κ and the
-    # value-side write target z = w ⊙ v. Defaults reduce to faithful SDM.
-    kappa_e = kappa if ew1 is None else _erase_gate(w_idx, ew1, ew2, root) * kappa
-    z = v if w is None else w.astype(D_TYPE) * v
+    # GDN-2 decoupling: erase-gated read weights κ_e = b ⊙ κ (recall direction)
+    # and the value-side write target z = w ⊙ v (b ≡ 1, w ≡ 1 ⇒ single-β SDM).
+    kappa_e = _erase_gate(w_idx, ew1, ew2, root) * kappa
+    z = w.astype(D_TYPE) * v
 
     alpha = jnp.exp(g)  # α_t = exp(g_t) ∈ (0,1], per-head forget gate   [L]
 
@@ -281,16 +288,17 @@ def _chunkwise_single_sdm(
     v: jax.Array,
     g: jax.Array,
     beta: jax.Array,
+    ew1: jax.Array,
+    ew2: jax.Array,
+    w: jax.Array,
     M0: jax.Array,
-    ew1: jax.Array | None = None,
-    ew2: jax.Array | None = None,
-    w: jax.Array | None = None,
     *,
     chunk_size: int,
     W: int,
     R: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Chunkwise-parallel SDM forward for ONE (batch, head) pair (paper App. A).
+    """Chunkwise-parallel Gated Sparse DeltaNet-2 forward for ONE (batch, head)
+    pair (paper App. A).
 
     Splits the L tokens into chunks of size C. An intra-chunk PARALLEL phase
     (batched over all chunks) builds the sparse write–write / read–write
@@ -306,10 +314,10 @@ def _chunkwise_single_sdm(
       v:        [L, dv]    values.
       g:        [L]        per-head log-decay (≤ 0).
       beta:     [L]        per-head input gate (∈ [0, 1]).
+      ew1, ew2: [L, root]  GDN-2 erase score halves (κ_e = b ⊙ κ on the
+                recall / interaction READ side).
+      w:        [L, dv]    GDN-2 value-side write gate (z = w ⊙ v).
       M0:       [N, dv]    initial memory (N = root²).
-      ew1, ew2: [L, root]  OPTIONAL GDN-2 erase score halves (κ_e = b ⊙ κ on
-                the recall/interaction READ side). None ⇒ faithful SDM.
-      w:        [L, dv]    OPTIONAL GDN-2 value-side write gate (z = w ⊙ v).
       chunk_size: C; L must be divisible by C.
       W, R:     number of write / read slots per token.
     Returns:
@@ -338,11 +346,11 @@ def _chunkwise_single_sdm(
     kappa = jax.nn.softmax(w_sc, axis=-1)  # [L, W]  write weights κ
     rho = jax.nn.softmax(r_sc, axis=-1)    # [L, R]  read  weights ρ
 
-    # GDN-2 decoupling (optional): erase-gated read weights κ_e = b ⊙ κ (used on
-    # the recall / A left side and the history read) and the value-side write
-    # target z = w ⊙ v. Both default to the faithful SDM quantities.
-    kappa_e = kappa if ew1 is None else _erase_gate(w_idx, ew1, ew2, root) * kappa
-    z = v if w is None else w.astype(D_TYPE) * v
+    # GDN-2 decoupling: erase-gated read weights κ_e = b ⊙ κ (used on the recall
+    # / A left side and the history read) and the value-side write target
+    # z = w ⊙ v. (b ≡ 1, w ≡ 1 recovers the single-β SDM special case.)
+    kappa_e = _erase_gate(w_idx, ew1, ew2, root) * kappa
+    z = w.astype(D_TYPE) * v
 
     # Fold everything into a leading chunk axis so the intra-chunk phase runs
     # on all Nc chunks at once (a = the chunk axis in the einsums below).
@@ -461,15 +469,11 @@ def _batchify_sdm(fn):
     """Lift a per-head SDM function to batched [B, H, ...] inputs.
 
     Pure plumbing, mirroring rule.py's _batchify: vmap over heads (axis 1),
-    then over batch (axis 0). Array arguments map over their leading axis;
-    None arguments (unused optional GDN-2 gates) pass through unmapped, so the
-    same wrapper serves the faithful call and any gate combination. W and R
-    stay static (closed over by `fn`)."""
-    def wrapped(*args):
-        in_axes = tuple(0 if a is not None else None for a in args)
-        over_heads = jax.vmap(fn, in_axes=in_axes, out_axes=(0, 0))
-        return jax.vmap(over_heads, in_axes=in_axes, out_axes=(0, 0))(*args)
-    return wrapped
+    then over batch (axis 0). All 11 array arguments map over their leading
+    axis; W and R stay static (closed over by `fn`)."""
+    in_axes = (0,) * 11
+    over_heads = jax.vmap(fn, in_axes=in_axes, out_axes=(0, 0))
+    return jax.vmap(over_heads, in_axes=in_axes, out_axes=(0, 0))
 
 
 def recurrent_sparse_delta_memory(
@@ -480,18 +484,18 @@ def recurrent_sparse_delta_memory(
     v: jax.Array,
     g: jax.Array,
     beta: jax.Array,
+    ew1: jax.Array,
+    ew2: jax.Array,
+    w: jax.Array,
     M0: jax.Array,
-    ew1: jax.Array | None = None,
-    ew2: jax.Array | None = None,
-    w: jax.Array | None = None,
     W: int = 64,
     R: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
-    """Token-by-token Sparse Delta Memory forward (reference / inference path).
+    """Token-by-token Gated Sparse DeltaNet-2 forward (reference / inference path).
 
-    Faithful SDM (single input gate β) by default; supply the optional GDN-2
-    gates (ew1, ew2, w) for the decoupled "Gated Sparse DeltaNet-2" variant.
-    Paper Eqs. 3-5 with PKM addressing (Sec. 2).
+    Sparse Delta Memory with the GDN-2 erase/write decoupling built in (paper
+    Eqs. 3-5 + PKM addressing, Sec. 2). Feeding b ≡ 1 (ew ≡ +∞) and w ≡ 1
+    recovers the single-β SDM special case.
 
     Args:
       kw1, kw2: [B, H, L, root]  write score halves (root = √N).
@@ -499,15 +503,15 @@ def recurrent_sparse_delta_memory(
       v:        [B, H, L, dv]    values.
       g:        [B, H, L]        per-head log-decay (≤ 0).
       beta:     [B, H, L]        per-head input gate (∈ [0, 1]).
+      ew1, ew2: [B, H, L, root]  GDN-2 erase score halves (κ_e = b⊙κ).
+      w:        [B, H, L, dv]    GDN-2 value-side write gate (z = w⊙v).
       M0:       [B, H, N, dv]    initial memory (N = root²).
-      ew1, ew2: [B, H, L, root]  OPTIONAL GDN-2 erase score halves (κ_e = b⊙κ).
-      w:        [B, H, L, dv]    OPTIONAL GDN-2 value-side write gate (z = w⊙v).
       W, R:     number of write / read slots per token.
     Returns:
       (y: [B, H, L, dv], M_final: [B, H, N, dv])
     """
     fn = partial(_recurrent_single_sdm, W=W, R=R)
-    return _batchify_sdm(fn)(kw1, kw2, qr1, qr2, v, g, beta, M0, ew1, ew2, w)
+    return _batchify_sdm(fn)(kw1, kw2, qr1, qr2, v, g, beta, ew1, ew2, w, M0)
 
 
 def chunkwise_sparse_delta_memory(
@@ -518,22 +522,21 @@ def chunkwise_sparse_delta_memory(
     v: jax.Array,
     g: jax.Array,
     beta: jax.Array,
+    ew1: jax.Array,
+    ew2: jax.Array,
+    w: jax.Array,
     M0: jax.Array,
-    ew1: jax.Array | None = None,
-    ew2: jax.Array | None = None,
-    w: jax.Array | None = None,
     chunk_size: int = 64,
     W: int = 64,
     R: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
-    """Chunkwise-parallel Sparse Delta Memory forward (training path).
+    """Chunkwise-parallel Gated Sparse DeltaNet-2 forward (training path).
 
-    Faithful SDM (single input gate β) by default; supply the optional GDN-2
-    gates (ew1, ew2, w) for the decoupled variant. The WY representation of
-    paper App. A. Same I/O contract as recurrent_sparse_delta_memory plus
-    chunk_size (L must be divisible by C); produces identical outputs to the
-    recurrent core (verified in test_sparse_rule.py) with only L/C sequential
-    steps.
+    Sparse Delta Memory with the GDN-2 erase/write decoupling built in, via the
+    WY representation of paper App. A. Same I/O contract as
+    recurrent_sparse_delta_memory plus chunk_size (L must be divisible by C);
+    produces identical outputs to the recurrent core (verified in
+    test_sparse_rule.py) with only L/C sequential steps.
 
     Args:
       kw1, kw2: [B, H, L, root]  write score halves (root = √N).
@@ -541,13 +544,13 @@ def chunkwise_sparse_delta_memory(
       v:        [B, H, L, dv]    values.
       g:        [B, H, L]        per-head log-decay (≤ 0).
       beta:     [B, H, L]        per-head input gate (∈ [0, 1]).
+      ew1, ew2: [B, H, L, root]  GDN-2 erase score halves (κ_e = b⊙κ).
+      w:        [B, H, L, dv]    GDN-2 value-side write gate (z = w⊙v).
       M0:       [B, H, N, dv]    initial memory (N = root²).
-      ew1, ew2: [B, H, L, root]  OPTIONAL GDN-2 erase score halves (κ_e = b⊙κ).
-      w:        [B, H, L, dv]    OPTIONAL GDN-2 value-side write gate (z = w⊙v).
       chunk_size: intra-chunk length C.
       W, R:     number of write / read slots per token.
     Returns:
       (y: [B, H, L, dv], M_final: [B, H, N, dv])
     """
     fn = partial(_chunkwise_single_sdm, chunk_size=chunk_size, W=W, R=R)
-    return _batchify_sdm(fn)(kw1, kw2, qr1, qr2, v, g, beta, M0, ew1, ew2, w)
+    return _batchify_sdm(fn)(kw1, kw2, qr1, qr2, v, g, beta, ew1, ew2, w, M0)
